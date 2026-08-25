@@ -62,12 +62,3 @@ jobs:
             "dist/Trademark-Report-v0.1.0-macOS-Apple-Silicon.zip" \
             "dist/Trademark-Report-v0.1.0-macOS-Apple-Silicon.zip.sha256" \
             --clobber
-
-      - name: Preserve build as workflow artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: Trademark-Report-v0.1.0-macOS-Apple-Silicon
-          path: |
-            dist/Trademark-Report-v0.1.0-macOS-Apple-Silicon.zip
-            dist/Trademark-Report-v0.1.0-macOS-Apple-Silicon.zip.sha256
-          if-no-files-found: error
