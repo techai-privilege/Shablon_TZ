@@ -1,0 +1,73 @@
+name: Build macOS Apple Silicon
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-arm64:
+    runs-on: macos-14
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          architecture: arm64
+          cache: pip
+
+      - name: Install dependencies
+        run: python -m pip install -e '.[build,dev]'
+
+      - name: Run tests
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: python -m pytest -q
+
+      - name: Build application
+        run: |
+          python -m PyInstaller --noconfirm --clean --windowed \
+            --name "Отчет по товарному знаку" \
+            --add-data "assets:assets" \
+            --add-data "data:data" \
+            app.py
+
+      - name: Verify Apple Silicon build
+        run: |
+          executable="dist/Отчет по товарному знаку.app/Contents/MacOS/Отчет по товарному знаку"
+          file "$executable"
+          file "$executable" | grep -q arm64
+          "dist/Отчет по товарному знаку.app/Contents/MacOS/Отчет по товарному знаку" --self-test
+          xattr -cr "dist/Отчет по товарному знаку.app"
+          codesign --verify --deep --strict "dist/Отчет по товарному знаку.app"
+
+      - name: Create downloadable archive
+        run: |
+          archive="Trademark-Report-v0.1.0-macOS-Apple-Silicon.zip"
+          ditto -c -k --sequesterRsrc --keepParent \
+            "dist/Отчет по товарному знаку.app" "dist/$archive"
+          cd dist
+          shasum -a 256 "$archive" > "$archive.sha256"
+
+      - name: Attach files to v0.1.0 release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload v0.1.0 \
+            "dist/Trademark-Report-v0.1.0-macOS-Apple-Silicon.zip" \
+            "dist/Trademark-Report-v0.1.0-macOS-Apple-Silicon.zip.sha256" \
+            --clobber
+
+      - name: Preserve build as workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Trademark-Report-v0.1.0-macOS-Apple-Silicon
+          path: |
+            dist/Trademark-Report-v0.1.0-macOS-Apple-Silicon.zip
+            dist/Trademark-Report-v0.1.0-macOS-Apple-Silicon.zip.sha256
+          if-no-files-found: error
