@@ -26,6 +26,7 @@ def test_native_window_has_expected_tabs_and_no_web_server():
     assert not window.centralWidget()._background.isNull()
     assert not hasattr(window, "conclusion_additions")
     assert not hasattr(window, "excess_items")
+    assert window.conclusion_preview.toPlainText().strip()
     assert any(
         button.text() == "Сформировать и сохранить DOCX"
         for button in window.findChildren(QPushButton)
@@ -33,6 +34,19 @@ def test_native_window_has_expected_tabs_and_no_web_server():
     window.russian.add_card()
     assert len(window.russian.cards) == 1
 
+    window.close()
+    application.processEvents()
+
+
+def test_edited_conclusion_is_passed_to_report_data():
+    application = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    window.conclusion_preview.setPlainText("Исправленный вручную текст")
+
+    report = window._report()
+
+    assert report.conclusion_content is not None
+    assert report.conclusion_content[0].runs[0].text == "Исправленный вручную текст"
     window.close()
     application.processEvents()
 

@@ -47,6 +47,20 @@ class ProbabilityEntry:
 
 
 @dataclass(slots=True)
+class ConclusionRun:
+    text: str
+    bold: bool = False
+    italic: bool = False
+    highlighted: bool = False
+
+
+@dataclass(slots=True)
+class ConclusionParagraph:
+    runs: list[ConclusionRun] = field(default_factory=list)
+    list_item: bool = False
+
+
+@dataclass(slots=True)
 class SimilarRecord:
     kind: str
     source_url: str = ""
@@ -73,6 +87,7 @@ class ReportData:
     trademarks_database_date: str = ""
     applications_database_date: str = ""
     conclusion: str = CONCLUSION_NONE
+    conclusion_content: list[ConclusionParagraph] | None = None
     performer: str = "Алина"
     probabilities: list[ProbabilityEntry] = field(default_factory=list)
     international_marks: list[SimilarRecord] = field(default_factory=list)

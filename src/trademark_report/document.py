@@ -17,7 +17,7 @@ from docx.opc.constants import RELATIONSHIP_TYPE as RT
 from docx.shared import Cm, Pt, RGBColor
 
 from .fees import calculate_fees, class_word, format_rubles
-from .models import PERFORMERS, ReportData, SimilarRecord
+from .models import ConclusionParagraph, ConclusionRun, PERFORMERS, ReportData, SimilarRecord
 from .templates import conclusion_paragraphs
 
 
@@ -267,27 +267,44 @@ def _add_conclusion(document: Document, report: ReportData) -> None:
 
     box = document.add_table(rows=1, cols=1)
     cell = box.cell(0, 0)
+    content = report.conclusion_content
+    if content is None:
+        content = []
+        for role, text in conclusion_paragraphs(report):
+            content.append(
+                ConclusionParagraph(
+                    runs=[
+                        ConclusionRun(
+                            text=text,
+                            bold=role in {"bold", "warning"},
+                            italic=role == "italic",
+                            highlighted=role == "warning",
+                        )
+                    ],
+                    list_item=role == "list",
+                )
+            )
+
     first = True
     list_index = 0
-    for role, text in conclusion_paragraphs(report):
+    for item in content:
         paragraph = _clear_cell(cell) if first else cell.add_paragraph()
         first = False
         _format_paragraph(paragraph, before=2, after=7, line=1.0, alignment=WD_ALIGN_PARAGRAPH.JUSTIFY)
-        if role == "list":
+        if item.list_item:
             marker = chr(ord("a") + list_index)
             list_index += 1
             _set_font(paragraph.add_run(f"{marker}) "), 10.5)
-            _set_font(paragraph.add_run(text), 10.5)
             paragraph.paragraph_format.left_indent = Cm(0.55)
             paragraph.paragraph_format.first_line_indent = Cm(-0.45)
-        else:
+        for content_run in item.runs:
             run = _set_font(
-                paragraph.add_run(text),
+                paragraph.add_run(content_run.text),
                 10.5,
-                bold=role == "bold" or role == "warning",
-                italic=role == "italic",
+                bold=content_run.bold,
+                italic=content_run.italic,
             )
-            if role == "warning":
+            if content_run.highlighted:
                 highlight = OxmlElement("w:highlight")
                 highlight.set(qn("w:val"), "yellow")
                 run._r.get_or_add_rPr().append(highlight)

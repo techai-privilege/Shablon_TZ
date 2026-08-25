@@ -9,7 +9,16 @@ import re
 import sys
 
 from PySide6.QtCore import QDate, QObject, QRect, QThread, Qt, Signal, Slot
-from PySide6.QtGui import QColor, QPainter, QPalette, QPixmap
+from PySide6.QtGui import (
+    QColor,
+    QFont,
+    QPainter,
+    QPalette,
+    QPixmap,
+    QTextCharFormat,
+    QTextCursor,
+    QTextListFormat,
+)
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -41,6 +50,8 @@ from trademark_report.fips import FipsParseError, TrademarkRecord, fetch_tradema
 from trademark_report.wipo import WipoParseError, fetch_wipo_trademark
 from trademark_report.models import (
     CONCLUSION_VALUES,
+    ConclusionParagraph,
+    ConclusionRun,
     PERFORMERS,
     PROBABILITY_VALUES,
     RELATIVE_OPTIONS,
@@ -49,6 +60,7 @@ from trademark_report.models import (
     ReportNiceClass,
     SimilarRecord,
 )
+from trademark_report.templates import conclusion_paragraphs
 
 
 ROOT = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
@@ -376,6 +388,7 @@ class MainWindow(QMainWindow):
         self.resize(1240, 860)
         self._build_ui()
         self._apply_style()
+        self._refresh_conclusion_preview()
 
     def _build_ui(self) -> None:
         root = BackgroundWidget(ROOT / "assets" / "app_background.jpg")
@@ -396,6 +409,7 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self._main_tab(), "Основные данные")
         self.tabs.addTab(self._conclusion_tab(), "Заключение")
         self.tabs.addTab(self._records_tab(), "Сходные обозначения")
+        self.tabs.currentChanged.connect(self._tab_changed)
         root_layout.addWidget(self.tabs, 1)
 
         generate = QPushButton("Сформировать и сохранить DOCX")
@@ -495,6 +509,7 @@ class MainWindow(QMainWindow):
         form = QFormLayout(box)
         self.conclusion = QComboBox()
         self.conclusion.addItems(CONCLUSION_VALUES)
+        self.conclusion.currentTextChanged.connect(self._conclusion_template_changed)
         self.performer = QComboBox()
         self.performer.addItems(PERFORMERS)
         form.addRow("Шаблон заключения *:", self.conclusion)
@@ -527,8 +542,149 @@ class MainWindow(QMainWindow):
         self.probability_table.setColumnWidth(1, 290)
         probability_layout.addWidget(self.probability_table)
         layout.addWidget(probability_box, 1)
+
+        preview_box = QGroupBox("Редактируемый текст заключения")
+        preview_layout = QVBoxLayout(preview_box)
+        hint = QLabel(
+            "Текст ниже попадёт в DOCX. При необходимости его можно исправить вручную."
+        )
+        hint.setProperty("subtitle", True)
+        preview_layout.addWidget(hint)
+        preview_actions = QHBoxLayout()
+        refresh = QPushButton("Сформировать заново по шаблону")
+        refresh.clicked.connect(self._confirm_refresh_conclusion)
+        refresh.setProperty("secondary", True)
+        bold = QPushButton("Жирный")
+        bold.clicked.connect(self._toggle_conclusion_bold)
+        italic = QPushButton("Курсив")
+        italic.clicked.connect(self._toggle_conclusion_italic)
+        preview_actions.addWidget(refresh)
+        preview_actions.addWidget(bold)
+        preview_actions.addWidget(italic)
+        preview_actions.addStretch()
+        preview_layout.addLayout(preview_actions)
+        self.conclusion_preview = QTextEdit()
+        self.conclusion_preview.setAcceptRichText(True)
+        self.conclusion_preview.setMinimumHeight(300)
+        self.conclusion_preview.setPlaceholderText("Текст заключения")
+        self.conclusion_preview.document().modificationChanged.connect(
+            self._conclusion_modification_changed
+        )
+        preview_layout.addWidget(self.conclusion_preview)
+        layout.addWidget(preview_box, 2)
         self._add_probability()
         return content
+
+    def _conclusion_template_report(self) -> ReportData:
+        """Build the subset of current data used by the conclusion templates."""
+        selected_relative = [box.text() for box in self.relative_checks if box.isChecked()]
+        return ReportData(
+            designation=self.designation.text().strip(),
+            search_queries=self.search_queries.toPlainText().strip(),
+            relative_options=selected_relative or ["Отсутствуют"],
+            conclusion=self.conclusion.currentText(),
+            international_marks=self.international.values(),
+            russian_marks=self.russian.values(),
+            applications=self.applications.values(),
+        )
+
+    def _refresh_conclusion_preview(self) -> None:
+        editor = self.conclusion_preview
+        editor.blockSignals(True)
+        editor.clear()
+        cursor = editor.textCursor()
+        for index, (role, text) in enumerate(
+            conclusion_paragraphs(self._conclusion_template_report())
+        ):
+            if index:
+                cursor.insertBlock()
+                current_list = cursor.currentList()
+                if role != "list" and current_list is not None:
+                    current_list.remove(cursor.block())
+            char_format = QTextCharFormat()
+            char_format.setFontWeight(
+                QFont.Weight.Bold if role in {"bold", "warning"} else QFont.Weight.Normal
+            )
+            char_format.setFontItalic(role == "italic")
+            if role == "warning":
+                char_format.setBackground(QColor("#fff200"))
+            cursor.setCharFormat(char_format)
+            cursor.insertText(text)
+            if role == "list":
+                list_format = QTextListFormat()
+                list_format.setStyle(QTextListFormat.Style.ListLowerAlpha)
+                list_format.setIndent(1)
+                cursor.createList(list_format)
+        editor.blockSignals(False)
+        editor.document().setModified(False)
+        self._conclusion_edited = False
+
+    def _conclusion_modification_changed(self, modified: bool) -> None:
+        if modified:
+            self._conclusion_edited = True
+
+    def _tab_changed(self, index: int) -> None:
+        if self.tabs.tabText(index) == "Заключение" and not self._conclusion_edited:
+            self._refresh_conclusion_preview()
+
+    def _conclusion_template_changed(self, _value: str) -> None:
+        if not getattr(self, "_conclusion_edited", False):
+            self._refresh_conclusion_preview()
+
+    def _confirm_refresh_conclusion(self) -> None:
+        if getattr(self, "_conclusion_edited", False):
+            answer = QMessageBox.question(
+                self,
+                "Заменить текст заключения?",
+                "Ручные изменения будут удалены. Сформировать текст заново по шаблону?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+        self._refresh_conclusion_preview()
+
+    def _merge_conclusion_format(self, *, bold: bool | None = None, italic: bool | None = None) -> None:
+        cursor = self.conclusion_preview.textCursor()
+        char_format = QTextCharFormat()
+        if bold is not None:
+            char_format.setFontWeight(QFont.Weight.Bold if bold else QFont.Weight.Normal)
+        if italic is not None:
+            char_format.setFontItalic(italic)
+        cursor.mergeCharFormat(char_format)
+        self.conclusion_preview.mergeCurrentCharFormat(char_format)
+
+    def _toggle_conclusion_bold(self) -> None:
+        current = self.conclusion_preview.currentCharFormat().fontWeight()
+        self._merge_conclusion_format(bold=current < QFont.Weight.Bold)
+
+    def _toggle_conclusion_italic(self) -> None:
+        current = self.conclusion_preview.currentCharFormat().fontItalic()
+        self._merge_conclusion_format(italic=not current)
+
+    def _conclusion_content(self) -> list[ConclusionParagraph]:
+        result: list[ConclusionParagraph] = []
+        block = self.conclusion_preview.document().begin()
+        while block.isValid():
+            runs: list[ConclusionRun] = []
+            iterator = block.begin()
+            while not iterator.atEnd():
+                fragment = iterator.fragment()
+                if fragment.isValid() and fragment.text():
+                    char_format = fragment.charFormat()
+                    background = char_format.background()
+                    runs.append(
+                        ConclusionRun(
+                            text=fragment.text(),
+                            bold=char_format.fontWeight() >= QFont.Weight.Bold,
+                            italic=char_format.fontItalic(),
+                            highlighted=background.style() != Qt.BrushStyle.NoBrush,
+                        )
+                    )
+                iterator += 1
+            result.append(ConclusionParagraph(runs=runs, list_item=block.textList() is not None))
+            block = block.next()
+        return result
 
     def _records_tab(self) -> QWidget:
         tabs = QTabWidget()
@@ -625,6 +781,8 @@ class MainWindow(QMainWindow):
             return "Заполните даты обновления обеих баз."
         if self.absolute_checkbox.isChecked() and not self.absolute_text.toPlainText().strip():
             return "Добавьте формулировку абсолютных оснований."
+        if not self.conclusion_preview.toPlainText().strip():
+            return "Заключение не может быть пустым."
         return None
 
     def _report(self) -> ReportData:
@@ -642,6 +800,7 @@ class MainWindow(QMainWindow):
             trademarks_database_date=self.tm_database_date.text().strip(),
             applications_database_date=self.app_database_date.text().strip(),
             conclusion=self.conclusion.currentText(),
+            conclusion_content=self._conclusion_content(),
             performer=self.performer.currentText(),
             probabilities=self._probabilities(),
             international_marks=self.international.values(),

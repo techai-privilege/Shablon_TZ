@@ -6,6 +6,8 @@ from docx import Document
 
 from trademark_report.document import _resource_root, generate_report
 from trademark_report.models import (
+    ConclusionParagraph,
+    ConclusionRun,
     ProbabilityEntry,
     ReportData,
     ReportNiceClass,
@@ -90,3 +92,30 @@ def test_fees_table_uses_class_count_reference_and_no_manual_excess_total():
     )
     assert fees_table.cell(2, 2).text.strip() == "28 000"
     assert fees_table.cell(3, 2).text.strip() == "…"
+
+
+def test_edited_conclusion_content_is_used_in_docx_with_formatting():
+    report = ReportData(
+        designation="TEST",
+        search_queries="TEST",
+        nice_classes=[ReportNiceClass("35", "услуги")],
+        trademarks_database_date="24.08.2026",
+        applications_database_date="24.08.2026",
+        conclusion_content=[
+            ConclusionParagraph(
+                runs=[ConclusionRun("Исправленный вывод эксперта", bold=True)]
+            ),
+            ConclusionParagraph(
+                runs=[ConclusionRun("Особое предупреждение", highlighted=True)]
+            ),
+        ],
+    )
+
+    document = Document(BytesIO(generate_report(report)))
+    conclusion_box = next(
+        table for table in document.tables if "Исправленный вывод эксперта" in table.cell(0, 0).text
+    )
+    paragraphs = conclusion_box.cell(0, 0).paragraphs
+    assert paragraphs[0].runs[0].bold is True
+    assert "Особое предупреждение" in paragraphs[1].text
+    assert paragraphs[1].runs[0]._r.xpath("./w:rPr/w:highlight")
