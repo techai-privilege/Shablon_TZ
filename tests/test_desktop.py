@@ -2,7 +2,7 @@ import os
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtWidgets import QApplication, QPushButton
+from PySide6.QtWidgets import QApplication, QPushButton, QScrollArea
 
 from app import MainWindow, RecordCard
 from trademark_report.fips import NiceClass, TrademarkRecord
@@ -47,6 +47,24 @@ def test_edited_conclusion_is_passed_to_report_data():
 
     assert report.conclusion_content is not None
     assert report.conclusion_content[0].runs[0].text == "Исправленный вручную текст"
+    window.close()
+    application.processEvents()
+
+
+def test_window_adapts_to_compact_laptop_size():
+    application = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    window.resize(800, 600)
+    window.show()
+    application.processEvents()
+
+    margins = window.root_layout.contentsMargins()
+    assert window.minimumWidth() <= 800
+    assert window.minimumHeight() <= 600
+    assert margins.left() == 10
+    assert isinstance(window.tabs.widget(1), QScrollArea)
+    assert window.conclusion_preview.minimumHeight() == 170
+
     window.close()
     application.processEvents()
 

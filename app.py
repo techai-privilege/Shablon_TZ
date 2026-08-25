@@ -384,38 +384,48 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.classes_directory = _load_classes()
         self.setWindowTitle("Отчет о проверке товарного знака")
-        self.setMinimumSize(1020, 700)
-        self.resize(1240, 860)
+        self.setMinimumSize(760, 540)
+        screen = QApplication.primaryScreen()
+        if screen is not None:
+            available = screen.availableGeometry()
+            self.resize(
+                min(1240, max(760, int(available.width() * 0.92))),
+                min(860, max(540, int(available.height() * 0.90))),
+            )
+        else:
+            self.resize(1020, 700)
         self._build_ui()
         self._apply_style()
         self._refresh_conclusion_preview()
 
     def _build_ui(self) -> None:
         root = BackgroundWidget(ROOT / "assets" / "app_background.jpg")
-        root_layout = QVBoxLayout(root)
-        root_layout.setContentsMargins(20, 18, 20, 16)
-        root_layout.setSpacing(10)
+        self.root_layout = QVBoxLayout(root)
+        self.root_layout.setContentsMargins(20, 18, 20, 16)
+        self.root_layout.setSpacing(10)
 
-        title = QLabel("Отчет о проверке товарного знака")
-        title.setProperty("title", True)
-        subtitle = QLabel(
+        self.title_label = QLabel("Отчет о проверке товарного знака")
+        self.title_label.setProperty("title", True)
+        self.subtitle_label = QLabel(
             "Данные ФИПС и WIPO заполняются автоматически, экспертные выводы остаются под вашим контролем."
         )
-        subtitle.setProperty("subtitle", True)
-        root_layout.addWidget(title)
-        root_layout.addWidget(subtitle)
+        self.subtitle_label.setProperty("subtitle", True)
+        self.root_layout.addWidget(self.title_label)
+        self.root_layout.addWidget(self.subtitle_label)
 
         self.tabs = QTabWidget()
+        self.tabs.tabBar().setUsesScrollButtons(True)
+        self.tabs.tabBar().setElideMode(Qt.TextElideMode.ElideNone)
         self.tabs.addTab(self._main_tab(), "Основные данные")
         self.tabs.addTab(self._conclusion_tab(), "Заключение")
         self.tabs.addTab(self._records_tab(), "Сходные обозначения")
         self.tabs.currentChanged.connect(self._tab_changed)
-        root_layout.addWidget(self.tabs, 1)
+        self.root_layout.addWidget(self.tabs, 1)
 
         generate = QPushButton("Сформировать и сохранить DOCX")
         generate.setMinimumHeight(46)
         generate.clicked.connect(self._generate)
-        root_layout.addWidget(generate)
+        self.root_layout.addWidget(generate)
         self.setCentralWidget(root)
         self.statusBar().showMessage("Готово")
 
@@ -425,6 +435,7 @@ class MainWindow(QMainWindow):
 
         report_box = QGroupBox("Данные отчета")
         form = QFormLayout(report_box)
+        form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows)
         self.designation = QLineEdit()
         self.search_queries = QTextEdit()
         self.search_queries.setMaximumHeight(80)
@@ -468,6 +479,7 @@ class MainWindow(QMainWindow):
 
         dates_box = QGroupBox("Актуальность баз")
         dates_form = QFormLayout(dates_box)
+        dates_form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows)
         self.tm_database_date = QLineEdit()
         self.tm_database_date.setPlaceholderText("ДД.ММ.ГГГГ")
         self.app_database_date = QLineEdit()
@@ -507,6 +519,7 @@ class MainWindow(QMainWindow):
 
         box = QGroupBox("Экспертное заключение")
         form = QFormLayout(box)
+        form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows)
         self.conclusion = QComboBox()
         self.conclusion.addItems(CONCLUSION_VALUES)
         self.conclusion.currentTextChanged.connect(self._conclusion_template_changed)
@@ -541,7 +554,6 @@ class MainWindow(QMainWindow):
         )
         self.probability_table.setColumnWidth(1, 290)
         probability_layout.addWidget(self.probability_table)
-        layout.addWidget(probability_box, 1)
 
         preview_box = QGroupBox("Редактируемый текст заключения")
         preview_layout = QVBoxLayout(preview_box)
@@ -565,15 +577,32 @@ class MainWindow(QMainWindow):
         preview_layout.addLayout(preview_actions)
         self.conclusion_preview = QTextEdit()
         self.conclusion_preview.setAcceptRichText(True)
-        self.conclusion_preview.setMinimumHeight(300)
+        self.conclusion_preview.setMinimumHeight(210)
         self.conclusion_preview.setPlaceholderText("Текст заключения")
         self.conclusion_preview.document().modificationChanged.connect(
             self._conclusion_modification_changed
         )
         preview_layout.addWidget(self.conclusion_preview)
         layout.addWidget(preview_box, 2)
+        layout.addWidget(probability_box, 1)
         self._add_probability()
-        return content
+        return _scrollable(content)
+
+    def resizeEvent(self, event) -> None:  # noqa: N802 - Qt naming convention
+        """Adapt spacing and nonessential chrome to the available window size."""
+        super().resizeEvent(event)
+        if not hasattr(self, "root_layout"):
+            return
+        compact = event.size().width() < 920 or event.size().height() < 690
+        if compact:
+            self.root_layout.setContentsMargins(10, 8, 10, 8)
+            self.root_layout.setSpacing(6)
+        else:
+            self.root_layout.setContentsMargins(20, 18, 20, 16)
+            self.root_layout.setSpacing(10)
+        self.subtitle_label.setVisible(event.size().height() >= 620)
+        if hasattr(self, "conclusion_preview"):
+            self.conclusion_preview.setMinimumHeight(170 if compact else 260)
 
     def _conclusion_template_report(self) -> ReportData:
         """Build the subset of current data used by the conclusion templates."""
