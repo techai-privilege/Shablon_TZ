@@ -10,7 +10,7 @@ from bs4 import BeautifulSoup, Tag
 import requests
 
 
-ALLOWED_FIPS_HOSTS = {"fips.ru", "www.fips.ru", "new.fips.ru"}
+ALLOWED_FIPS_HOSTS = {"fips.ru", "www.fips.ru", "www1.fips.ru", "new.fips.ru"}
 DEFAULT_TIMEOUT_SECONDS = 25
 # A deliberately simple browser identifier is accepted more consistently by
 # the DDoS protection in front of the public register than a fabricated full
@@ -64,21 +64,31 @@ def _validate_fips_url(url: str) -> str:
     parsed = urlparse(url.strip())
     if parsed.scheme != "https" or (parsed.hostname or "").lower() not in ALLOWED_FIPS_HOSTS:
         raise FipsParseError("Нужна HTTPS-ссылка на публичную карточку сайта fips.ru.")
-    if "registers-doc-view" not in parsed.path or "fips_servlet" not in parsed.path:
+    supported_path = (
+        "registers-doc-view" in parsed.path or "fips_servl" in parsed.path
+    ) and "fips_servlet" in parsed.path
+    if not supported_path:
         raise FipsParseError("Ссылка не похожа на карточку реестра ФИПС.")
     return parsed.geturl()
 
 
-def _paragraph_by_code(soup: BeautifulSoup, code: str) -> Tag | None:
+def _paragraphs_by_code(soup: BeautifulSoup, code: str) -> list[Tag]:
     pattern = re.compile(rf"^\s*\({re.escape(code)}\)")
-    return next(
-        (p for p in soup.find_all("p") if pattern.search(p.get_text(" ", strip=True))),
-        None,
-    )
+    return [
+        p for p in soup.find_all("p") if pattern.search(p.get_text(" ", strip=True))
+    ]
 
 
-def _bold_value_by_code(soup: BeautifulSoup, code: str) -> str | None:
-    paragraph = _paragraph_by_code(soup, code)
+def _paragraph_by_code(soup: BeautifulSoup, code: str) -> Tag | None:
+    paragraphs = _paragraphs_by_code(soup, code)
+    return paragraphs[0] if paragraphs else None
+
+
+def _bold_value_by_code(
+    soup: BeautifulSoup, code: str, *, latest: bool = False
+) -> str | None:
+    paragraphs = _paragraphs_by_code(soup, code)
+    paragraph = paragraphs[-1] if latest and paragraphs else (paragraphs[0] if paragraphs else None)
     if paragraph is None:
         return None
     bold = paragraph.find("b")
@@ -190,7 +200,10 @@ def parse_trademark_html(html: bytes | str, source_url: str) -> TrademarkRecord:
         filing_date=_bold_value_by_code(soup, "220") or _bold_value_by_code(soup, "200"),
         registration_date=_bold_value_by_code(soup, "151"),
         expiry_date=_bold_value_by_code(soup, "181"),
-        owner=_bold_value_by_code(soup, "732"),
+        # The base card contains the original holder. Later register events
+        # (assignment, succession, or a name/address change) append another
+        # (732) block at the bottom, so the final occurrence is authoritative.
+        owner=_bold_value_by_code(soup, "732", latest=True),
         applicant=_bold_value_by_code(soup, "731"),
         unprotected_elements=_bold_value_by_code(soup, "526"),
         nice_classes=_parse_nice_classes(soup),

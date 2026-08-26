@@ -9,6 +9,10 @@ APPLICATION_URL = (
     "https://new.fips.ru/registers-doc-view/"
     "fips_servlet?DB=RUTMAP&DocNumber=2025802265&TypeFile=html"
 )
+LEGACY_URL = (
+    "https://www1.fips.ru/fips_servl/"
+    "fips_servlet?DB=RUTM&rn=1895&DocNumber=570067"
+)
 
 
 SAMPLE_HTML = """\
@@ -81,3 +85,36 @@ def test_rejects_non_fips_url():
         assert "fips.ru" in str(exc)
     else:
         raise AssertionError("Expected FipsParseError")
+
+
+def test_latest_owner_is_used_after_assignment_and_name_change():
+    html = """\
+    <html><body>
+    <p class="bib">(111) <b>570067</b></p>
+    <p class="bib">(732) <i>Правообладатель:</i>
+      <b>Первоначальный правообладатель (RU)</b></p>
+    <hr>
+    <p><b>Государственная регистрация договора об отчуждении исключительного права</b></p>
+    <p class="bib">(732) <i>Правообладатель:</i>
+      <b>Новый правообладатель (RU)</b></p>
+    <hr>
+    <p><b>Государственная регистрация договора о предоставлении права использования</b></p>
+    <p><i>Лицензиат:</i> <b>Лицензиат не является правообладателем (RU)</b></p>
+    <hr>
+    <p><b>Изменение наименования правообладателя</b></p>
+    <p class="bib">(732) <i>Правообладатель:</i>
+      <b>Актуальное наименование правообладателя (RU)</b></p>
+    </body></html>
+    """
+
+    record = parse_trademark_html(html, LEGACY_URL)
+
+    assert record.registration_number == "570067"
+    assert record.owner == "Актуальное наименование правообладателя (RU)"
+
+
+def test_legacy_www1_fips_card_url_is_supported():
+    record = parse_trademark_html(SAMPLE_HTML, LEGACY_URL)
+
+    assert record.database == "RUTM"
+    assert record.owner == "ООО «АЙЛЭНД» (RU)"
