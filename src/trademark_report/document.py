@@ -47,7 +47,7 @@ def _clear_body(document: Document) -> None:
             body.remove(child)
 
 
-def _set_font(run, size: float = 10.5, *, bold: bool | None = None, italic: bool | None = None):
+def _set_font(run, size: float = 11, *, bold: bool | None = None, italic: bool | None = None):
     run.font.name = "Calibri"
     run._element.get_or_add_rPr().get_or_add_rFonts().set(qn("w:ascii"), "Calibri")
     run._element.get_or_add_rPr().get_or_add_rFonts().set(qn("w:hAnsi"), "Calibri")
@@ -145,14 +145,14 @@ def _clear_cell(cell):
     return paragraph
 
 
-def _cell_text(cell, text: str, *, bold=False, italic=False, size=10.5, alignment=WD_ALIGN_PARAGRAPH.LEFT):
+def _cell_text(cell, text: str, *, bold=False, italic=False, size=11, alignment=WD_ALIGN_PARAGRAPH.LEFT):
     paragraph = _clear_cell(cell)
     _format_paragraph(paragraph, after=0, alignment=alignment)
     _set_font(paragraph.add_run(text), size, bold=bold, italic=italic)
     return paragraph
 
 
-def _add_hyperlink(paragraph, text: str, url: str, *, size=10.5, bold=False) -> None:
+def _add_hyperlink(paragraph, text: str, url: str, *, size=11, bold=False) -> None:
     relationship_id = paragraph.part.relate_to(url, RT.HYPERLINK, is_external=True)
     hyperlink = OxmlElement("w:hyperlink")
     hyperlink.set(qn("r:id"), relationship_id)
@@ -190,7 +190,7 @@ def _add_page_break(document: Document) -> None:
 def _add_title(document: Document, report: ReportData) -> None:
     date_paragraph = document.add_paragraph()
     _format_paragraph(date_paragraph, after=16, alignment=WD_ALIGN_PARAGRAPH.RIGHT)
-    date_run = _set_font(date_paragraph.add_run(f"Дата отчета {report.report_date:%d.%m.%Y}"), 10.5)
+    date_run = _set_font(date_paragraph.add_run(f"Дата отчета {report.report_date:%d.%m.%Y}"), 11)
     date_run.font.color.rgb = GRAY
 
     title = document.add_paragraph()
@@ -201,10 +201,10 @@ def _add_title(document: Document, report: ReportData) -> None:
 
 def _add_summary(document: Document, report: ReportData) -> None:
     table = document.add_table(rows=0, cols=2)
-    for label, value in (
-        ("Поисковые запросы", report.search_queries),
-        ("Сфера деятельности", report.business_area),
-    ):
+    summary_fields = [("Поисковые запросы", report.search_queries)]
+    if report.business_area.strip():
+        summary_fields.append(("Сфера деятельности", report.business_area))
+    for label, value in summary_fields:
         row = table.add_row()
         _set_cell_shading(row.cells[0], BLUE_FILL)
         _cell_text(row.cells[0], label, bold=True)
@@ -221,8 +221,8 @@ def _add_summary(document: Document, report: ReportData) -> None:
         if index:
             paragraph = row.cells[1].add_paragraph()
             _format_paragraph(paragraph, after=0)
-        _set_font(paragraph.add_run(f"Класс {item.number}: "), 10.5, bold=True)
-        _set_font(paragraph.add_run(item.description), 10.5)
+        _set_font(paragraph.add_run(f"Класс {item.number}: "), 11, bold=True)
+        _set_font(paragraph.add_run(item.description), 11)
     _prepare_table(table, [5.3, 11.7])
 
     spacer = document.add_paragraph()
@@ -246,15 +246,13 @@ def _add_summary(document: Document, report: ReportData) -> None:
     selected = [item for item in report.relative_options if item != "Отсутствуют"]
     relative_text = "; ".join(selected) if selected else "Отсутствуют"
     _set_font(relative_paragraph.add_run(relative_text))
-    if selected and report.has_appendix:
-        _set_font(relative_paragraph.add_run(" (см. Приложение 1)"))
     date_one = relative_cell.add_paragraph()
     _format_paragraph(date_one, before=8, after=1)
-    run = _set_font(date_one.add_run(f"База товарных знаков обновлена {report.trademarks_database_date}"), 9.5, italic=True)
+    run = _set_font(date_one.add_run(f"База товарных знаков обновлена {report.trademarks_database_date}"), 11, italic=True)
     run.font.color.rgb = GRAY
     date_two = relative_cell.add_paragraph()
     _format_paragraph(date_two, after=0)
-    run = _set_font(date_two.add_run(f"База заявок на товарные знаки обновлена {report.applications_database_date}"), 9.5, italic=True)
+    run = _set_font(date_two.add_run(f"База заявок на товарные знаки обновлена {report.applications_database_date}"), 11, italic=True)
     run.font.color.rgb = GRAY
     _prepare_table(grounds, [5.3, 11.7])
 
@@ -294,13 +292,13 @@ def _add_conclusion(document: Document, report: ReportData) -> None:
         if item.list_item:
             marker = chr(ord("a") + list_index)
             list_index += 1
-            _set_font(paragraph.add_run(f"{marker}) "), 10.5)
+            _set_font(paragraph.add_run(f"{marker}) "), 11)
             paragraph.paragraph_format.left_indent = Cm(0.55)
             paragraph.paragraph_format.first_line_indent = Cm(-0.45)
         for content_run in item.runs:
             run = _set_font(
                 paragraph.add_run(content_run.text),
-                10.5,
+                11,
                 bold=content_run.bold,
                 italic=content_run.italic,
             )
@@ -328,8 +326,8 @@ def _add_conclusion(document: Document, report: ReportData) -> None:
     signature = document.add_paragraph()
     _format_paragraph(signature, before=8, after=0, alignment=WD_ALIGN_PARAGRAPH.RIGHT)
     performer_name = PERFORMERS.get(report.performer, report.performer)
-    _set_font(signature.add_run(f"С уважением,\n{performer_name}\n8-800-222-90-53\n"), 10.5)
-    _add_hyperlink(signature, "www.patentural.ru", "https://www.patentural.ru/", size=10.5)
+    _set_font(signature.add_run(f"С уважением,\n{performer_name}\n8-800-222-90-53\n"), 11)
+    _add_hyperlink(signature, "www.patentural.ru", "https://www.patentural.ru/", size=11)
 
 
 def _add_section_caption(document: Document, text: str) -> None:
@@ -373,18 +371,18 @@ def _add_record_table(document: Document, record: SimilarRecord) -> None:
         try:
             image_paragraph.add_run().add_picture(BytesIO(record.image_bytes), width=Cm(4.2))
         except Exception:
-            _set_font(image_paragraph.add_run("Изображение не удалось вставить"), 8, italic=True)
+            _set_font(image_paragraph.add_run("Изображение не удалось вставить"), 11, italic=True)
     elif record.display_name:
-        _set_font(image_paragraph.add_run(record.display_name), 14, bold=True)
+        _set_font(image_paragraph.add_run(record.display_name), 11, bold=True)
 
     for index, (label, value) in enumerate(fields):
         _cell_text(table.cell(index, 1), label, bold=True, alignment=WD_ALIGN_PARAGRAPH.CENTER)
         value_paragraph = _clear_cell(table.cell(index, 2))
         _format_paragraph(value_paragraph, after=0, alignment=WD_ALIGN_PARAGRAPH.CENTER)
         if index == 0 and record.source_url.strip() and record.number.strip():
-            _add_hyperlink(value_paragraph, record.number, record.source_url, size=10, bold=False)
+            _add_hyperlink(value_paragraph, record.number, record.source_url, size=11, bold=False)
         else:
-            _set_font(value_paragraph.add_run(value or "—"), 10)
+            _set_font(value_paragraph.add_run(value or "—"), 11)
     _prepare_table(table, [5.4, 5.2, 6.4])
     paragraph = document.add_paragraph()
     _format_paragraph(paragraph, after=1)
@@ -393,7 +391,7 @@ def _add_record_table(document: Document, record: SimilarRecord) -> None:
 def _add_appendix(document: Document, report: ReportData) -> None:
     heading = document.add_paragraph()
     _format_paragraph(heading, after=14, alignment=WD_ALIGN_PARAGRAPH.RIGHT)
-    _set_font(heading.add_run("Приложение 1"), 10.5, bold=True)
+    _set_font(heading.add_run("Приложение 1"), 11, bold=True)
 
     sections = (
         ("МЕЖДУНАРОДНЫЕ ТОВАРНЫЕ ЗНАКИ, ЗАРЕГИСТРИРОВАННЫЕ В РФ", report.international_marks),
@@ -458,7 +456,7 @@ def _add_fees(document: Document, report: ReportData) -> None:
 
     note = document.add_paragraph()
     _format_paragraph(note, before=12, after=5)
-    _set_font(note.add_run("Примечание:"), 10.5)
+    _set_font(note.add_run("Примечание:"), 11)
     notes = (
         "Срок действия товарного знака — 10 лет с даты подачи заявки.",
         "Пошлина за подачу заявки может быть оплачена в течение двух месяцев с даты подачи "
@@ -471,7 +469,7 @@ def _add_fees(document: Document, report: ReportData) -> None:
         _format_paragraph(paragraph, after=3, alignment=WD_ALIGN_PARAGRAPH.JUSTIFY)
         paragraph.paragraph_format.left_indent = Cm(0.55)
         paragraph.paragraph_format.first_line_indent = Cm(-0.45)
-        _set_font(paragraph.add_run(f"{index}. {text}"), 10)
+        _set_font(paragraph.add_run(f"{index}. {text}"), 11)
 
     for _ in range(2):
         _format_paragraph(document.add_paragraph(), after=0)
@@ -481,7 +479,7 @@ def _add_fees(document: Document, report: ReportData) -> None:
     cell = social.cell(0, 0)
     paragraph = _clear_cell(cell)
     _format_paragraph(paragraph, before=4, after=4, alignment=WD_ALIGN_PARAGRAPH.CENTER)
-    _set_font(paragraph.add_run("Подписывайтесь на нас в соцсетях!"), 10.5, bold=True, italic=True)
+    _set_font(paragraph.add_run("Подписывайтесь на нас в соцсетях!"), 11, bold=True, italic=True)
     paragraph = cell.add_paragraph()
     _format_paragraph(paragraph, after=5)
     _set_font(
@@ -489,7 +487,7 @@ def _add_fees(document: Document, report: ReportData) -> None:
             "Рассказываем об интеллектуальной собственности просто и с юмором. Активно делимся "
             "яркими моментами, полезной информацией и эксклюзивными новостями."
         ),
-        9.5,
+        11,
         italic=True,
     )
     links = (
@@ -503,14 +501,14 @@ def _add_fees(document: Document, report: ReportData) -> None:
         paragraph = cell.add_paragraph()
         _format_paragraph(paragraph, after=0)
         paragraph.paragraph_format.left_indent = Cm(1.8)
-        _add_hyperlink(paragraph, text, url, size=9.5)
+        _add_hyperlink(paragraph, text, url, size=11)
     paragraph = cell.add_paragraph()
     _format_paragraph(paragraph, before=3, after=4)
     _set_font(
         paragraph.add_run(
             "*Meta (Instagram) признана экстремистской организацией и запрещена на территории РФ*"
         ),
-        8.5,
+        11,
         italic=True,
     )
     _prepare_table(social, [17.0])

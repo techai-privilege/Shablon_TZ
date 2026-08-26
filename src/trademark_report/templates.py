@@ -51,8 +51,12 @@ def _found_records(report: ReportData) -> str:
 
 
 def _obstacle_verb(report: ReportData) -> str:
-    definite_options = {"Препятствующий ТЗ", "Препятствующая заявка"}
-    return "будут" if definite_options.intersection(report.relative_options) else "могут"
+    definite = any(
+        "препятствующий товарный знак" in option.lower()
+        or "будет препятствовать регистрации" in option.lower()
+        for option in report.relative_options
+    )
+    return "будут" if definite else "могут"
 
 
 def conclusion_paragraphs(report: ReportData) -> list[tuple[str, str]]:

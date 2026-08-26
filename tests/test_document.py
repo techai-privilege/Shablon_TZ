@@ -1,5 +1,6 @@
 from datetime import date
 from io import BytesIO
+import re
 from zipfile import ZipFile
 
 from docx import Document
@@ -119,3 +120,45 @@ def test_edited_conclusion_content_is_used_in_docx_with_formatting():
     assert paragraphs[0].runs[0].bold is True
     assert "Особое предупреждение" in paragraphs[1].text
     assert paragraphs[1].runs[0]._r.xpath("./w:rPr/w:highlight")
+
+
+def test_empty_business_area_row_is_omitted_and_body_font_is_11_pt():
+    report = ReportData(
+        designation="TEST",
+        search_queries="TEST",
+        business_area="",
+        nice_classes=[ReportNiceClass("35", "услуги")],
+        trademarks_database_date="24.08.2026",
+        applications_database_date="24.08.2026",
+    )
+
+    generated = generate_report(report)
+    document = Document(BytesIO(generated))
+    body_text = "\n".join(
+        cell.text for table in document.tables for row in table.rows for cell in row.cells
+    )
+    assert "Сфера деятельности" not in body_text
+
+    with ZipFile(BytesIO(generated)) as archive:
+        document_xml = archive.read("word/document.xml").decode("utf-8")
+    font_sizes = set(re.findall(r'<w:sz w:val="(\d+)"', document_xml))
+    assert font_sizes == {"22"}
+
+
+def test_relative_obstacle_uses_exact_selected_wording_once():
+    wording = "Найден препятствующий товарный знак (см. Приложение 1)"
+    report = ReportData(
+        designation="TEST",
+        search_queries="TEST",
+        nice_classes=[ReportNiceClass("35", "услуги")],
+        relative_options=[wording],
+        trademarks_database_date="24.08.2026",
+        applications_database_date="24.08.2026",
+        russian_marks=[SimilarRecord(kind="russian", number="123")],
+    )
+
+    document = Document(BytesIO(generate_report(report)))
+    body_text = "\n".join(
+        cell.text for table in document.tables for row in table.rows for cell in row.cells
+    )
+    assert body_text.count(wording) == 1

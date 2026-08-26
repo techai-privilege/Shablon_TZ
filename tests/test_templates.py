@@ -11,7 +11,7 @@ def test_obstacle_conclusion_separates_marks_and_applications():
         designation="FELICE",
         search_queries="FELICE",
         conclusion="Есть препятствия",
-        relative_options=["Препятствующий ТЗ"],
+        relative_options=["Найден препятствующий товарный знак (см. Приложение 1)"],
         russian_marks=[SimilarRecord(kind="russian", display_name="FELICHE")],
         applications=[SimilarRecord(kind="application", number="2026708897")],
     )
@@ -30,7 +30,7 @@ def test_consent_conclusion_uses_potential_wording():
         designation="SAULUK",
         search_queries="SAULUK",
         conclusion="Письма-согласия",
-        relative_options=["Заявка, которая может препятствовать"],
+        relative_options=["Найдена заявка, которая может препятствовать регистрации (см. Приложение 1)"],
         applications=[SimilarRecord(kind="application", display_name="SAULUK WAY")],
     )
 
