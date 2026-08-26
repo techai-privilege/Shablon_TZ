@@ -448,7 +448,12 @@ def _add_fees(document: Document, report: ReportData) -> None:
     merged = table.cell(3, 0).merge(table.cell(3, 1))
     _cell_text(merged, "ИТОГО", bold=True, alignment=WD_ALIGN_PARAGRAPH.CENTER)
     total_cell = table.cell(3, 2).merge(table.cell(3, 3))
-    _cell_text(total_cell, "…", bold=True, alignment=WD_ALIGN_PARAGRAPH.CENTER)
+    _cell_text(
+        total_cell,
+        f"{format_rubles(fees.total)} + 500 за каждый товар/услугу свыше 10",
+        bold=True,
+        alignment=WD_ALIGN_PARAGRAPH.CENTER,
+    )
     _prepare_table(table, [0.8, 7.4, 4.0, 4.8])
 
     note = document.add_paragraph()
