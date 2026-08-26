@@ -450,7 +450,7 @@ def _add_fees(document: Document, report: ReportData) -> None:
     total_cell = table.cell(3, 2).merge(table.cell(3, 3))
     _cell_text(
         total_cell,
-        f"{format_rubles(fees.total)} + 500 за каждый товар/услугу свыше 10",
+        format_rubles(fees.total),
         bold=True,
         alignment=WD_ALIGN_PARAGRAPH.CENTER,
     )

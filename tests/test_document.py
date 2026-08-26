@@ -72,7 +72,7 @@ def test_resource_root_uses_pyinstaller_bundle(monkeypatch, tmp_path):
     assert _resource_root() == tmp_path
 
 
-def test_fees_table_calculates_total_and_keeps_excess_items_condition():
+def test_fees_table_calculates_numeric_total_without_informational_suffix():
     report = ReportData(
         designation="TEST",
         search_queries="TEST",
@@ -91,9 +91,7 @@ def test_fees_table_calculates_total_and_keeps_excess_items_condition():
         "48 500 + 500 за каждый товар/услугу свыше 10"
     )
     assert fees_table.cell(2, 2).text.strip() == "28 000"
-    assert fees_table.cell(3, 2).text.strip() == (
-        "76 500 + 500 за каждый товар/услугу свыше 10"
-    )
+    assert fees_table.cell(3, 2).text.strip() == "76 500"
 
 
 def test_edited_conclusion_content_is_used_in_docx_with_formatting():
