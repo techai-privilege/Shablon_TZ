@@ -8,7 +8,7 @@ from pathlib import Path
 import re
 import sys
 
-from PySide6.QtCore import QDate, QObject, QRect, QThread, Qt, Signal, Slot
+from PySide6.QtCore import QDate, QObject, QPoint, QRect, QThread, QTimer, Qt, Signal, Slot
 from PySide6.QtGui import (
     QColor,
     QFont,
@@ -33,10 +33,12 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QListWidget,
     QMainWindow,
     QMessageBox,
     QPushButton,
     QScrollArea,
+    QStackedWidget,
     QTabWidget,
     QTableWidget,
     QTableWidgetItem,
@@ -61,6 +63,7 @@ from trademark_report.models import (
     SimilarRecord,
 )
 from trademark_report.templates import conclusion_paragraphs
+from trademark_report.software_widget import SoftwareConsentWidget
 
 
 ROOT = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
@@ -383,9 +386,9 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.classes_directory = _load_classes()
-        self.setWindowTitle("Отчет о проверке товарного знака")
+        self.setWindowTitle("Документы по интеллектуальной собственности")
         self.setMinimumSize(760, 540)
-        screen = QApplication.primaryScreen()
+        screen = QApplication.screenAt(QPoint(0, 0)) or QApplication.primaryScreen()
         if screen is not None:
             available = screen.availableGeometry()
             self.resize(
@@ -400,18 +403,31 @@ class MainWindow(QMainWindow):
 
     def _build_ui(self) -> None:
         root = BackgroundWidget(ROOT / "assets" / "app_background.jpg")
-        self.root_layout = QVBoxLayout(root)
+        self.root_layout = QHBoxLayout(root)
         self.root_layout.setContentsMargins(20, 18, 20, 16)
         self.root_layout.setSpacing(10)
 
+        self.navigation = QListWidget()
+        self.navigation.setObjectName("mainNavigation")
+        self.navigation.setFixedWidth(220)
+        self.navigation.setWordWrap(True)
+        self.navigation.setTextElideMode(Qt.TextElideMode.ElideNone)
+        self.navigation.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.navigation.addItems(["Отчёт по товарному знаку", "Программа для ЭВМ"])
+        self.root_layout.addWidget(self.navigation)
+
+        self.pages = QStackedWidget()
+        trademark_page = QWidget()
+        trademark_layout = QVBoxLayout(trademark_page)
+        trademark_layout.setContentsMargins(0, 0, 0, 0)
         self.title_label = QLabel("Отчет о проверке товарного знака")
         self.title_label.setProperty("title", True)
         self.subtitle_label = QLabel(
             "Данные ФИПС и WIPO заполняются автоматически, экспертные выводы остаются под вашим контролем."
         )
         self.subtitle_label.setProperty("subtitle", True)
-        self.root_layout.addWidget(self.title_label)
-        self.root_layout.addWidget(self.subtitle_label)
+        trademark_layout.addWidget(self.title_label)
+        trademark_layout.addWidget(self.subtitle_label)
 
         self.tabs = QTabWidget()
         self.tabs.tabBar().setUsesScrollButtons(True)
@@ -420,12 +436,21 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self._conclusion_tab(), "Заключение")
         self.tabs.addTab(self._records_tab(), "Сходные обозначения")
         self.tabs.currentChanged.connect(self._tab_changed)
-        self.root_layout.addWidget(self.tabs, 1)
+        trademark_layout.addWidget(self.tabs, 1)
 
         generate = QPushButton("Сформировать и сохранить DOCX")
         generate.setMinimumHeight(46)
         generate.clicked.connect(self._generate)
-        self.root_layout.addWidget(generate)
+        trademark_layout.addWidget(generate)
+        self.pages.addWidget(trademark_page)
+
+        self.software_page = SoftwareConsentWidget(ROOT / "assets" / "software_consent_template.docx")
+        self.software_page.status_message.connect(self.statusBar().showMessage)
+        self.pages.addWidget(self.software_page)
+        self.root_layout.addWidget(self.pages, 1)
+        self.navigation.currentRowChanged.connect(self.pages.setCurrentIndex)
+        self.navigation.currentRowChanged.connect(self._main_section_changed)
+        self.navigation.setCurrentRow(0)
         self.setCentralWidget(root)
         self.statusBar().showMessage("Готово")
 
@@ -601,8 +626,20 @@ class MainWindow(QMainWindow):
             self.root_layout.setContentsMargins(20, 18, 20, 16)
             self.root_layout.setSpacing(10)
         self.subtitle_label.setVisible(event.size().height() >= 620)
+        self.navigation.setFixedWidth(180 if compact else 220)
         if hasattr(self, "conclusion_preview"):
             self.conclusion_preview.setMinimumHeight(170 if compact else 260)
+
+    def _main_section_changed(self, index: int) -> None:
+        if index == 1:
+            self.setWindowTitle("Согласия авторов программы для ЭВМ")
+        else:
+            self.setWindowTitle("Отчет о проверке товарного знака")
+
+    def closeEvent(self, event) -> None:  # noqa: N802 - Qt naming convention
+        if hasattr(self, "software_page"):
+            self.software_page.stop_workers()
+        super().closeEvent(event)
 
     def _conclusion_template_report(self) -> ReportData:
         """Build the subset of current data used by the conclusion templates."""
@@ -952,6 +989,21 @@ class MainWindow(QMainWindow):
             }
             QTableWidget { gridline-color: #d6dde5; alternate-background-color: #f8fafc; }
             QStatusBar { background-color: #ffffff; color: #475569; border-top: 1px solid #d6dde5; }
+            QListWidget#mainNavigation {
+                background-color: rgba(255, 255, 255, 220); color: #243447;
+                border: 1px solid #d6dde5; border-radius: 9px; padding: 6px;
+                outline: none; font-weight: 600;
+            }
+            QListWidget#mainNavigation::item {
+                min-height: 42px; padding: 8px 10px; border-radius: 6px; margin: 2px;
+            }
+            QListWidget#mainNavigation::item:selected {
+                background-color: #e9426f; color: #ffffff;
+            }
+            QLabel[warning="true"] {
+                background-color: rgba(255, 244, 229, 235); color: #8a4b08;
+                border: 1px solid #f2c078; border-radius: 6px; padding: 8px;
+            }
             QScrollBar:vertical { background: #eef2f6; width: 12px; margin: 0; }
             QScrollBar::handle:vertical { background: #a9b6c3; min-height: 28px; border-radius: 6px; }
             QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
@@ -959,11 +1011,56 @@ class MainWindow(QMainWindow):
         )
 
 
+def _bring_window_to_front(app: QApplication, window: MainWindow) -> None:
+    """Show and activate the native window, including when started from VS Code."""
+    window.showNormal()
+    screen = QApplication.screenAt(QPoint(0, 0)) or QApplication.primaryScreen()
+    if screen is not None:
+        frame = window.frameGeometry()
+        frame.moveCenter(screen.availableGeometry().center())
+        window.move(frame.topLeft())
+    window.raise_()
+    window.activateWindow()
+
+    if sys.platform != "darwin":
+        return
+    try:
+        from ctypes import c_bool, c_long, c_void_p, cdll
+
+        objc = cdll.LoadLibrary("/usr/lib/libobjc.A.dylib")
+        objc.objc_getClass.restype = c_void_p
+        objc.sel_registerName.restype = c_void_p
+        objc.objc_msgSend.restype = c_void_p
+        objc.objc_msgSend.argtypes = [c_void_p, c_void_p]
+        ns_application = objc.objc_getClass(b"NSApplication")
+        shared_application = objc.objc_msgSend(
+            ns_application, objc.sel_registerName(b"sharedApplication")
+        )
+        objc.objc_msgSend.restype = c_bool
+        objc.objc_msgSend.argtypes = [c_void_p, c_void_p, c_long]
+        objc.objc_msgSend(
+            shared_application,
+            objc.sel_registerName(b"setActivationPolicy:"),
+            0,  # NSApplicationActivationPolicyRegular
+        )
+        objc.objc_msgSend.restype = None
+        objc.objc_msgSend.argtypes = [c_void_p, c_void_p, c_bool]
+        objc.objc_msgSend(
+            shared_application,
+            objc.sel_registerName(b"activateIgnoringOtherApps:"),
+            True,
+        )
+    except (AttributeError, OSError):
+        # Qt activation above remains the portable fallback.
+        pass
+
+
 def main() -> int:
     app = QApplication.instance() or QApplication(sys.argv)
-    app.setApplicationName("Отчет по товарному знаку")
+    app.setApplicationName("Документы по интеллектуальной собственности")
     window = MainWindow()
     window.show()
+    QTimer.singleShot(0, lambda: _bring_window_to_front(app, window))
     return app.exec()
 
 
@@ -971,6 +1068,9 @@ def _packaged_self_test() -> int:
     """Exercise bundled resources and DOCX generation without opening the GUI."""
 
     from tempfile import TemporaryDirectory
+
+    from trademark_report.consent_document import save_consents
+    from trademark_report.software_models import SoftwareAuthor, SoftwareConsentData
 
     report = ReportData(
         designation="TEST",
@@ -984,7 +1084,31 @@ def _packaged_self_test() -> int:
         with TemporaryDirectory() as directory:
             output = Path(directory) / "self-test.docx"
             save_report(report, output)
-            return 0 if output.is_file() and output.stat().st_size else 1
+            consent_output = Path(directory) / "consent-self-test.docx"
+            save_consents(
+                SoftwareConsentData(
+                    program_name="TEST",
+                    applicant_name='ООО "TEST"',
+                    applicant_address="TEST",
+                    inn="7707083893",
+                    ogrn="1027700132195",
+                    authors=[
+                        SoftwareAuthor(
+                            full_name="Иванов Иван Иванович",
+                            birth_date="01.01.1980",
+                            address="TEST",
+                            passport_series="4510",
+                            passport_number="123456",
+                            passport_issue_date="01.01.2020",
+                            passport_issuer="TEST",
+                            creative_contribution="TEST",
+                        )
+                    ],
+                ),
+                consent_output,
+            )
+            outputs = (output, consent_output)
+            return 0 if all(item.is_file() and item.stat().st_size for item in outputs) else 1
     except Exception:
         return 1
 
