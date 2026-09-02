@@ -7,10 +7,6 @@ on:
         description: Existing GitHub Release tag
         required: true
         default: v0.2.0
-      source_ref:
-        description: Git ref to build
-        required: true
-        default: main
 
 permissions:
   contents: write
@@ -25,7 +21,7 @@ jobs:
       - name: Checkout source
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.source_ref }}
+          ref: ${{ inputs.release_tag }}
 
       - name: Set up Python
         uses: actions/setup-python@v5
