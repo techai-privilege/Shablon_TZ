@@ -4,6 +4,7 @@ import requests
 from trademark_report import ogrn as ogrn_module
 from trademark_report.ogrn import (
     OgrnLookupError,
+    extract_full_registration_name,
     extract_registered_address,
     fetch_ogrn,
     fetch_registration_data,
@@ -63,6 +64,9 @@ def test_fns_lookup_returns_ogrn_and_registered_address(monkeypatch):
         ogrn_module,
         "_pdf_text",
         lambda _content: """
+Настоящая выписка содержит сведения о юридическом лице
+ОБЩЕСТВО С ОГРАНИЧЕННОЙ ОТВЕТСТВЕННОСТЬЮ "ТЕСТ"
+полное наименование юридического лица
 Адрес юридического лица
 117312,
 Г.МОСКВА,
@@ -77,7 +81,18 @@ def test_fns_lookup_returns_ogrn_and_registered_address(monkeypatch):
 
     assert result.ogrn == "1027700132195"
     assert result.address == "117312, Г.МОСКВА, УЛ. ВАВИЛОВА, Д.19"
-    assert result.name == 'ООО "ТЕСТ"'
+    assert result.name == 'ОБЩЕСТВО С ОГРАНИЧЕННОЙ ОТВЕТСТВЕННОСТЬЮ "ТЕСТ"'
+
+
+def test_full_registration_name_parser_handles_table_layout():
+    text = """
+1 Полное наименование на русском языке ОБЩЕСТВО С ОГРАНИЧЕННОЙ
+ОТВЕТСТВЕННОСТЬЮ "СКЛАДСКИЕ СИСТЕМЫ"
+2 ГРН и дата внесения в ЕГРЮЛ записи
+"""
+    assert extract_full_registration_name(text) == (
+        'ОБЩЕСТВО С ОГРАНИЧЕННОЙ ОТВЕТСТВЕННОСТЬЮ "СКЛАДСКИЕ СИСТЕМЫ"'
+    )
 
 
 def test_address_parser_does_not_return_unrelated_statement_text():

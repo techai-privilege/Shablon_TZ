@@ -12,6 +12,26 @@ from .software_models import QuestionnaireParseResult, SoftwareAuthor, SoftwareC
 
 
 DATE_RE = re.compile(r"\b(\d{2}\.\d{2}\.\d{4})\s*(?:г\.?|года)?", re.IGNORECASE)
+TEXT_DATE_RE = re.compile(
+    r"[«\"]?(\d{1,2})[»\"]?\s+"
+    r"(января|февраля|марта|апреля|мая|июня|июля|августа|сентября|октября|ноября|декабря)"
+    r"\s+(\d{4})\s*(?:г\.?|года)?",
+    re.IGNORECASE,
+)
+MONTHS = {
+    "января": 1,
+    "февраля": 2,
+    "марта": 3,
+    "апреля": 4,
+    "мая": 5,
+    "июня": 6,
+    "июля": 7,
+    "августа": 8,
+    "сентября": 9,
+    "октября": 10,
+    "ноября": 11,
+    "декабря": 12,
+}
 NAME_RE = re.compile(
     r"\b([А-ЯЁ][а-яё-]+(?:-[А-ЯЁ][а-яё-]+)?\s+"
     r"[А-ЯЁ][а-яё-]+(?:-[А-ЯЁ][а-яё-]+)?\s+"
@@ -63,6 +83,27 @@ def _rows(table) -> list[tuple[str, str]]:
             break
         if label and _norm(label) != _norm(value):
             result.append((label, value))
+    return result
+
+
+def _section_one_rows(document: Document) -> list[tuple[str, str]]:
+    """Collect section-I rows even when Word splits them across several tables."""
+
+    result: list[tuple[str, str]] = []
+    started = False
+    for table in document.tables:
+        whole = _norm(" ".join(cell.text for row in table.rows for cell in row.cells))
+        if not started:
+            if "наименование программы" not in whole and "область сфера применения" not in whole:
+                continue
+            started = True
+        elif re.match(r"^раздел ii(?:\s|$)", whole):
+            break
+        result.extend(_rows(table))
+        if "раздел ii" in whole and "раздел i " not in whole:
+            break
+    if not result:
+        raise ValueError("В документе не найдена таблица раздела I со сведениями для Роспатента.")
     return result
 
 
@@ -142,6 +183,22 @@ def _extract_program_name(document: Document) -> str:
 
 def _extract_names(value: str) -> list[str]:
     result = []
+    exact_name = re.compile(
+        r"^[А-ЯЁ][А-ЯЁа-яё-]+\s+[А-ЯЁ][А-ЯЁа-яё-]+\s+[А-ЯЁ][А-ЯЁа-яё-]+$"
+    )
+    for line in value.splitlines():
+        candidate = re.sub(r"^\s*[-–—•●]+\s*", "", line).strip(" ,;:.")
+        if not exact_name.fullmatch(candidate):
+            continue
+        if any(word in candidate.upper().split() for word in ("ВЫДАН", "ПАСПОРТ", "РОССИИ")):
+            continue
+        if candidate.isupper():
+            candidate = " ".join(
+                "-".join(part.capitalize() for part in word.split("-"))
+                for word in candidate.split()
+            )
+        if candidate not in result:
+            result.append(candidate)
     for match in NAME_RE.finditer(value):
         name = match.group(1)
         if name not in result and not any(
@@ -149,6 +206,41 @@ def _extract_names(value: str) -> list[str]:
         ):
             result.append(name)
     return result
+
+
+def _normalize_numeric_dates(value: str) -> str:
+    return re.sub(
+        r"(?<!\d)(\d{1,2})\.\s*(\d{1,2})\.\s*(\d{4})(?!\d)",
+        lambda match: f"{int(match.group(1)):02d}.{int(match.group(2)):02d}.{match.group(3)}",
+        value,
+    )
+
+
+def _text_date_value(match: re.Match) -> str:
+    return f"{int(match.group(1)):02d}.{MONTHS[match.group(2).lower()]:02d}.{match.group(3)}"
+
+
+def _looks_like_passport_value(value: str) -> bool:
+    text = _normalize_numeric_dates(value)
+    has_identity = bool(_extract_names(text)) and bool(DATE_RE.search(text) or TEXT_DATE_RE.search(text))
+    has_passport = bool(
+        re.search(r"(?i)\bпаспорт\b", text)
+        or re.search(r"(?<!\d)(?:\d{2}\s+\d{2}|\d{4})\s+\d{6}(?!\d)", text)
+        or re.search(r"(?i)\b[А-ЯЁA-Z]{2}\s*№\s*\d{6,9}\b", text)
+    )
+    return has_identity and has_passport
+
+
+def _passport_only_text(value: str) -> str:
+    lines = []
+    for line in value.splitlines():
+        if re.match(
+            r"(?i)^\s*[-–—•●]+\s*(?:разработ|написан|системн|формализац|программ|тестирован|проектирован)",
+            line,
+        ):
+            break
+        lines.append(line)
+    return "\n".join(lines)
 
 
 def _split_author_chunks(value: str) -> list[str]:
@@ -180,8 +272,29 @@ def _strip_author_prefix(value: str) -> str:
     return _clean(re.sub(r"(?i)^\s*(?:автор\s*)?\d+\s*[.:)]\s*", "", value))
 
 
+def _clean_passport_issuer(value: str) -> str:
+    """Remove questionnaire-only fields accidentally captured as the issuer."""
+
+    value = re.split(
+        r"(?i)\b(?:код\s+подразделения|дата\s+выдачи|"
+        r"зарегистрирован\w*|проживающ\w*|место\s+жительства)\b\s*[:—-]?",
+        value,
+        maxsplit=1,
+    )[0]
+    return re.sub(r"\s+", " ", value.replace("\u200b", "")).strip(" ,;:-")
+
+
+def _clean_author_address(value: str) -> str:
+    value = re.sub(
+        r"(?i)^\s*(?:адрес\s+)?места?\s+жительства\s*[:—-]?\s*",
+        "",
+        value,
+    )
+    return _clean(value).lstrip("-–—•● ").strip(" ;")
+
+
 def _extract_passport(author: SoftwareAuthor, value: str) -> None:
-    text = _strip_author_prefix(value)
+    text = _normalize_numeric_dates(_strip_author_prefix(_passport_only_text(value)))
     author.source_text = text
     names = _extract_names(text)
     if names and not author.full_name:
@@ -200,7 +313,9 @@ def _extract_passport(author: SoftwareAuthor, value: str) -> None:
         r"(?i)паспорт(?:\s+гражданина\s+РФ)?\s*[:—-]?\s*(?:серия|серии)?\s*[«\"]?(\d{2})\s*(\d{2})[»\"]?\s*[,;]?\s*(?:номер|№)?\s*[«\"]?(\d{6})",
         r"(?i)паспорт(?:\s+РФ)?\s*(\d{4})\s*(\d{6})",
         r"(?i)(?:серия|серии)\s*[«\"]?(\d{2})\s*(\d{2})[»\"]?\s*[,;]?\s*(?:номер|№)\s*[«\"]?(\d{6})",
+        r"(?i)паспорт\s+([А-ЯЁA-Z]{2})\s*№\s*(\d{6,9})",
         r"(?<!\d)(\d{2})\s+(\d{2})\s+(\d{6})(?!\d)",
+        r"(?<!\d)(\d{4})\s+(\d{6})(?!\d)",
     )
     for pattern in passport_patterns:
         match = re.search(pattern, text)
@@ -241,12 +356,35 @@ def _extract_passport(author: SoftwareAuthor, value: str) -> None:
     issued_after = re.search(
         r"(?is)\bвыдан(?:ный|а)?\s+(.+?)\s+(\d{2}\.\d{2}\.\d{4})(?=\s|$)", text
     )
+    text_date_match = TEXT_DATE_RE.search(text)
+    text_issue_date = _text_date_value(text_date_match) if text_date_match else ""
+    text_date_issuer = ""
+    if text_date_match:
+        line_start = text.rfind("\n", 0, text_date_match.start()) + 1
+        line_end = text.find("\n", text_date_match.end())
+        if line_end < 0:
+            line_end = len(text)
+        line = text[line_start:line_end]
+        marker = re.search(r"(?i)\bвыдан(?:ный|а)?\b", line)
+        if marker:
+            relative_date_start = text_date_match.start() - line_start
+            before = line[: marker.start()].strip(" ,;:-")
+            after_marker = line[marker.end() : relative_date_start].strip(" ,;:-")
+            after_date = line[text_date_match.end() - line_start :].strip(" ,;:-")
+            if before and not re.search(r"(?i)\bпаспорт\b|\d{6}", before):
+                text_date_issuer = before
+            elif after_marker:
+                text_date_issuer = after_marker
+            elif after_date:
+                text_date_issuer = after_date
     if issue_label:
         author.passport_issue_date = issue_label.group(1)
     elif issued_before:
         author.passport_issue_date = issued_before.group(1)
     elif issued_after:
         author.passport_issue_date = issued_after.group(2)
+    elif text_issue_date:
+        author.passport_issue_date = text_issue_date
     elif len(dates) >= 2:
         author.passport_issue_date = next((item for item in dates if item != author.birth_date), "")
 
@@ -254,6 +392,8 @@ def _extract_passport(author: SoftwareAuthor, value: str) -> None:
         author.passport_issuer = _clean(issued_before.group(2))
     elif issued_after:
         author.passport_issuer = _clean(issued_after.group(1))
+    elif text_date_issuer:
+        author.passport_issuer = _clean(text_date_issuer)
     else:
         issuer = re.search(
             r"(?is)\bвыдан(?:ный|а)?\s+(.+?)(?=\b(?:код\s+подразделения|дата\s+выдачи|место\s+жительства|дата\s+рождения|зарегистр)\b|$)",
@@ -261,6 +401,24 @@ def _extract_passport(author: SoftwareAuthor, value: str) -> None:
         )
         if issuer:
             author.passport_issuer = _clean(issuer.group(1))
+    if not author.passport_issuer and author.passport_issue_date:
+        date_position = text.find(author.passport_issue_date)
+        if date_position >= 0:
+            possible_issuer = text[date_position + len(author.passport_issue_date) :]
+            possible_issuer = possible_issuer.split("\n", 1)[0].strip(" ,;:-")
+            if possible_issuer:
+                author.passport_issuer = _clean(possible_issuer)
+            else:
+                line_start = text.rfind("\n", 0, date_position) + 1
+                before_date = text[line_start:date_position]
+                passport_pair = re.search(
+                    r"(?<!\d)(?:\d{2}\s+\d{2}|\d{4})\s+\d{6}(?!\d)",
+                    before_date,
+                )
+                if passport_pair:
+                    possible_issuer = before_date[passport_pair.end() :].strip(" ,;:-")
+                    if possible_issuer:
+                        author.passport_issuer = _clean(possible_issuer)
     if not author.passport_issuer:
         issuer = re.search(
             r"(?is)орган,?\s+выдавший\s+документ\s*:\s*(?:орган\s+)?(.+?)(?=\b(?:зарегистр|прожива)\b|$)",
@@ -270,22 +428,43 @@ def _extract_passport(author: SoftwareAuthor, value: str) -> None:
             author.passport_issuer = _clean(issuer.group(1))
     if author.passport_issue_date and author.passport_issuer:
         author.passport_issuer = _clean(author.passport_issuer.replace(author.passport_issue_date, ""))
+    author.passport_issuer = _clean_passport_issuer(author.passport_issuer)
 
     address_patterns = (
-        r"(?is)(?:зарегистрирован\w*|проживающ\w*)\s+(?:по\s+)?адресу\s*[:—-]?\s*(.+)$",
-        r"(?is)место\s+жительства\s*[:—-]?\s*(.+?)(?=\bдата\s+рождения\b|$)",
+        r"(?is)(?:зарегистрирован\w*|проживающ\w*)\s+(?:по\s+)?адресу\s*[:—-]?\s*"
+        r"(.+?)(?=\n\s*[-–—•●]+\s*(?:разработ|написан|системн|формализац|программ|тестирован)|$)",
+        r"(?is)место\s+жительства\s*[:—-]?\s*(.+?)"
+        r"(?=\n\s*[-–—•●]*\s*(?:серия|паспорт|дата\s+выдачи|выдан)|$)",
     )
     for pattern in address_patterns:
         match = re.search(pattern, text)
         if match:
-            author.address = _clean(match.group(1)).lstrip("-–—•● ")
+            author.address = _clean_author_address(match.group(1))
             break
     if not author.address:
         lines = [_clean(line) for line in text.splitlines() if _clean(line)]
         for line in lines:
-            if re.search(r"(?i)\b(россия|российская федерация|обл\.?|край|г\.|город|ул\.|д\.)\b", line) and not re.search(r"(?i)паспорт|выдан", line):
+            cleaned_line = re.sub(r"^\s*[-–—•●]+\s*", "", line).strip(" ;")
+            date_only = re.fullmatch(
+                r"(?i)\d{2}\.\d{2}\.\d{4}\s*(?:г\.?р\.?|года\s+рождения)?",
+                cleaned_line,
+            )
+            passport_numbers = re.search(
+                r"(?<!\d)(?:\d{2}\s+\d{2}|\d{4})\s+\d{6}(?!\d)",
+                cleaned_line,
+            )
+            if (
+                re.search(
+                    r"(?i)(?:\b(?:россия|российская\s+федерация|обл\.?|край|город|ул\.?|дом)\b|"
+                    r"\bг\.|\bд\.|(?<!\d)\d{6}\s*,)",
+                    cleaned_line,
+                )
+                and not re.search(r"(?i)паспорт|выдан|дата\s+рождения", cleaned_line)
+                and not date_only
+                and not passport_numbers
+            ):
                 if author.full_name not in line:
-                    author.address = line.lstrip("-–—•● ")
+                    author.address = _clean_author_address(cleaned_line)
                     break
 
 
@@ -304,7 +483,7 @@ def _clean_contribution(value: str) -> str:
 def parse_questionnaire(path: str | Path) -> QuestionnaireParseResult:
     source = Path(path)
     document = Document(source)
-    rows = _rows(_candidate_table(document))
+    rows = _section_one_rows(document)
     warnings: list[str] = []
     authors_will_be_mentioned = _authors_will_be_mentioned(rows)
 
@@ -350,7 +529,9 @@ def parse_questionnaire(path: str | Path) -> QuestionnaireParseResult:
                 sequential_bases.append(value)
             continue
         if looks_passport and looks_contribution:
-            if re.search(r"(?i)паспорт|серия|номер|выдан|дата рождения|г\.р\.", value):
+            if _looks_like_passport_value(value) or re.search(
+                r"(?i)паспорт|серия|номер|выдан|дата рождения|г\.р\.", value
+            ):
                 chunks = _split_author_chunks(value)
                 if len(chunks) > 1:
                     sequential_passports.extend(chunks)

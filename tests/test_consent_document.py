@@ -2,6 +2,8 @@ from datetime import date
 from zipfile import ZipFile
 
 from docx import Document
+from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.oxml.ns import qn
 
 from trademark_report.consent_document import (
     DEFAULT_CONSENT_TEMPLATE,
@@ -28,7 +30,10 @@ def _data() -> SoftwareConsentData:
                 passport_series="4510",
                 passport_number="123456",
                 passport_issue_date="02.02.2020",
-                passport_issuer="ГУ МВД России по г. Москве",
+                passport_issuer=(
+                    "ГУ МВД России по г. Москве\n"
+                    "Код подразделения: 770-068\nДата выдачи:"
+                ),
                 creative_contribution="Разработка алгоритма",
             ),
             SoftwareAuthor(
@@ -61,6 +66,16 @@ def test_combined_consents_preserve_template_and_remove_comments(tmp_path):
     assert "Тестовая программа" in text
     assert "1027700132195" in text
     assert "26.08.2026" in text
+    assert "2026888888" not in text
+    assert "№ заявки" not in text
+    assert "Заявка №" not in text
+    assert "регистрационного номера заявки" not in text
+    assert "серия «4510» номер «123456» выдан 02.02.2020" in text
+    assert "выдан «02.02.2020" not in text
+    assert "Код подразделения" not in text
+    assert "Дата выдачи:" not in text
+    assert "«Разработка алгоритма»" not in text
+    assert "Разработка алгоритма" in text
     assert "ФИО" not in text
     recipient_paragraphs = [
         paragraph
@@ -70,6 +85,23 @@ def test_combined_consents_preserve_template_and_remove_comments(tmp_path):
     assert len(recipient_paragraphs) == 2
     assert recipient_paragraphs[0].paragraph_format.page_break_before is not True
     assert recipient_paragraphs[1].paragraph_format.page_break_before is True
+
+    identity_paragraphs = [
+        paragraph
+        for paragraph in document.paragraphs
+        if paragraph.text.startswith("Документ, удостоверяющий личность")
+    ]
+    assert identity_paragraphs
+    assert all("\n" not in paragraph.text for paragraph in identity_paragraphs)
+    assert all(
+        paragraph.alignment == WD_ALIGN_PARAGRAPH.JUSTIFY
+        for paragraph in identity_paragraphs
+    )
+    table_widths = [
+        int(table._tbl.tblPr.find(qn("w:tblW")).get(qn("w:w")))
+        for table in document.tables
+    ]
+    assert table_widths == [10244, 10244]
 
     with ZipFile(output) as archive:
         names = set(archive.namelist())

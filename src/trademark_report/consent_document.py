@@ -12,9 +12,10 @@ from tempfile import NamedTemporaryFile, TemporaryDirectory
 from zipfile import ZIP_DEFLATED, ZipFile
 
 from docx import Document
+from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
-from docx.shared import Pt
+from docx.shared import Cm, Pt
 from lxml import etree
 
 from .software_models import SoftwareAuthor, SoftwareConsentData
@@ -85,13 +86,62 @@ def _set_text_preserve(paragraph, text: str) -> None:
         run.text = ""
 
 
+def _remove_paragraph(paragraph) -> None:
+    element = paragraph._element
+    parent = element.getparent()
+    if parent is not None:
+        parent.remove(element)
+
+
+def _expand_table_width(table, extra_width=Cm(0.5)) -> None:
+    """Expand a fixed-width template table while preserving column proportions."""
+
+    table_width = table._tbl.tblPr.find(qn("w:tblW"))
+    if table_width is None or table_width.get(qn("w:type")) != "dxa":
+        return
+    old_width = int(table_width.get(qn("w:w"), "0"))
+    if old_width <= 0:
+        return
+    new_width = old_width + extra_width.twips
+    table_width.set(qn("w:w"), str(new_width))
+
+    grid_columns = list(table._tbl.tblGrid)
+    old_grid_widths = [int(column.get(qn("w:w"), "0")) for column in grid_columns]
+    if old_grid_widths and sum(old_grid_widths) > 0:
+        remaining = new_width
+        for index, (column, width) in enumerate(zip(grid_columns, old_grid_widths)):
+            scaled = (
+                remaining
+                if index == len(grid_columns) - 1
+                else round(width * new_width / old_width)
+            )
+            column.set(qn("w:w"), str(scaled))
+            remaining -= scaled
+
+    for cell in table._tbl.iter(qn("w:tc")):
+        cell_width = cell.find(f"{qn('w:tcPr')}/{qn('w:tcW')}")
+        if cell_width is None or cell_width.get(qn("w:type")) != "dxa":
+            continue
+        width = int(cell_width.get(qn("w:w"), "0"))
+        cell_width.set(qn("w:w"), str(round(width * new_width / old_width)))
+
+
 def _passport_text(author: SoftwareAuthor) -> str:
+    def single_line(value: str) -> str:
+        return re.sub(r"\s+", " ", value.replace("\u200b", "")).strip()
+
+    issuer = re.split(
+        r"(?i)\b(?:код\s+подразделения|дата\s+выдачи)\s*[:—-]?",
+        author.passport_issuer,
+        maxsplit=1,
+    )[0]
+    issuer = single_line(issuer).strip(" ,;:-")
     when_and_where = " ".join(
-        item for item in (author.passport_issue_date, author.passport_issuer) if item
+        item for item in (single_line(author.passport_issue_date), issuer) if item
     )
     return (
-        f"Паспорт гражданина РФ, серия «{author.passport_series}» "
-        f"номер «{author.passport_number}» выдан «{when_and_where}»"
+        f"Паспорт гражданина РФ, серия «{single_line(author.passport_series)}» "
+        f"номер «{single_line(author.passport_number)}» выдан {when_and_where}"
     )
 
 
@@ -117,8 +167,9 @@ def _fill_author_document(document: Document, data: SoftwareConsentData, author:
             continue
         if text == "«…»":
             exact_ellipsis_seen += 1
-            value = data.program_name if page_one or exact_ellipsis_seen == 1 else author.creative_contribution
-            _set_text_preserve(paragraph, f"«{value}»")
+            is_program_name = page_one or exact_ellipsis_seen == 1
+            value = data.program_name if is_program_name else author.creative_contribution
+            _set_text_preserve(paragraph, f"«{value}»" if is_program_name else value)
             if not page_one and exact_ellipsis_seen > 1:
                 size = 7.5 if len(value) > 500 else 8.5 if len(value) > 300 else 9.5
                 paragraph.paragraph_format.space_before = Pt(0)
@@ -128,12 +179,13 @@ def _fill_author_document(document: Document, data: SoftwareConsentData, author:
                     run.font.size = Pt(size)
             continue
         if text.startswith("№ заявки"):
-            line = f"№ заявки {data.application_number}" if data.application_number else "№ заявки " + "_" * 58
-            _set_text_preserve(paragraph, line)
+            _remove_paragraph(paragraph)
+            continue
+        if text.startswith("(указывается при наличии регистрационного номера заявки"):
+            _remove_paragraph(paragraph)
             continue
         if text.startswith("Заявка №"):
-            line = f"Заявка № {data.application_number}" if data.application_number else "Заявка № " + "_" * 62
-            _set_text_preserve(paragraph, line)
+            _remove_paragraph(paragraph)
             continue
         if text.startswith("Название:"):
             _set_text_preserve(paragraph, f"Название: «{data.program_name}»")
@@ -145,8 +197,9 @@ def _fill_author_document(document: Document, data: SoftwareConsentData, author:
             _set_text_preserve(paragraph, f"Адрес места жительства  {author.address}")
             continue
         if text.startswith("Документ, удостоверяющий личность"):
-            prefix = "Документ, удостоверяющий личность субъекта персональных данных, дата его выдачи\nи выдавший орган  "
+            prefix = "Документ, удостоверяющий личность субъекта персональных данных, дата его выдачи и выдавший орган  "
             _set_text_preserve(paragraph, prefix + _passport_text(author))
+            paragraph.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
             continue
         if text.startswith("Общество с ограниченной ответственностью"):
             _set_text_preserve(paragraph, data.applicant_name)
@@ -197,6 +250,7 @@ def _fill_author_document(document: Document, data: SoftwareConsentData, author:
     # The template reserves a very tall final row for the attorney/date block.
     # A smaller minimum keeps long, unabridged author contributions on page 2.
     if document.tables and len(document.tables[0].rows) >= 6:
+        _expand_table_width(document.tables[0])
         row = document.tables[0].rows[5]
         cell = row.cells[0]
         empty_after_text = False

@@ -157,7 +157,7 @@ def test_fns_result_fills_ogrn_and_applicant_address():
     application.processEvents()
 
 
-def test_fns_result_does_not_overwrite_existing_applicant_name():
+def test_fns_result_replaces_short_applicant_name_with_full_name():
     application = QApplication.instance() or QApplication([])
     window = MainWindow()
     page = window.software_page
@@ -169,7 +169,7 @@ def test_fns_result_does_not_overwrite_existing_applicant_name():
         FnsRegistrationData(ogrn="1027700132195", name="Название из ФНС")
     )
 
-    assert page.applicant_name.text() == "Название из анкеты"
+    assert page.applicant_name.text() == "Название из ФНС"
 
     window.close()
     application.processEvents()

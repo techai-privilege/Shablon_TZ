@@ -197,8 +197,6 @@ class SoftwareConsentWidget(QWidget):
         self.ogrn_button.clicked.connect(self.lookup_ogrn)
         ogrn_row.addWidget(self.ogrn, 1)
         ogrn_row.addWidget(self.ogrn_button)
-        self.application_number = QLineEdit()
-        self.application_number.setPlaceholderText("Необязательно")
         self.document_date = QDateEdit(QDate.currentDate())
         self.document_date.setCalendarPopup(True)
         self.document_date.setDisplayFormat("dd.MM.yyyy")
@@ -207,7 +205,6 @@ class SoftwareConsentWidget(QWidget):
         common_form.addRow("Адрес заявителя *:", self.applicant_address)
         common_form.addRow("ИНН *:", self.inn)
         common_form.addRow("ОГРН/ОГРНИП *:", ogrn_row)
-        common_form.addRow("Номер заявки:", self.application_number)
         common_form.addRow("Дата:", self.document_date)
         form_layout.addWidget(common_box)
 
@@ -262,7 +259,7 @@ class SoftwareConsentWidget(QWidget):
         self.save_button.clicked.connect(self.save_document)
         layout.addWidget(self.save_button)
 
-        for widget in (self.program_name, self.inn, self.ogrn, self.application_number):
+        for widget in (self.program_name, self.inn, self.ogrn):
             widget.textChanged.connect(self._refresh_preview)
         self.applicant_name.textChanged.connect(self._applicant_name_changed)
         self.applicant_address.textChanged.connect(self._applicant_address_changed)
@@ -303,7 +300,6 @@ class SoftwareConsentWidget(QWidget):
         self.applicant_address.setPlainText(data.applicant_address)
         self.inn.setText(data.inn)
         self.ogrn.setText(data.ogrn)
-        self.application_number.setText(data.application_number)
         self.document_date.setDate(
             QDate(data.document_date.year, data.document_date.month, data.document_date.day)
         )
@@ -437,7 +433,7 @@ class SoftwareConsentWidget(QWidget):
         if re.sub(r"\D", "", self.inn.text()) == self._ogrn_lookup_inn:
             self.ogrn.setText(result.ogrn)
             received = ["ОГРН"]
-            if result.name and not self.applicant_name.text().strip():
+            if result.name:
                 self.applicant_name.setText(result.name)
                 received.append("наименование заявителя")
             if result.address:
@@ -474,7 +470,7 @@ class SoftwareConsentWidget(QWidget):
             applicant_address=self.applicant_address.toPlainText().strip(),
             inn=re.sub(r"\D", "", self.inn.text()),
             ogrn=re.sub(r"\D", "", self.ogrn.text()),
-            application_number=self.application_number.text().strip(),
+            application_number="",
             document_date=date(qdate.year(), qdate.month(), qdate.day()),
             authors=[editor.value() for editor in self.author_editors],
             authors_will_be_mentioned=self._authors_will_be_mentioned,
@@ -508,12 +504,19 @@ class SoftwareConsentWidget(QWidget):
         def value(text: str) -> str:
             return escape(text).replace("\n", "<br>") or '<span class="missing">не заполнено</span>'
 
+        def passport_value(text: str) -> str:
+            return value(re.sub(r"\s+", " ", text.replace("\u200b", "")).strip())
+
+        issuer = re.split(
+            r"(?i)\b(?:код\s+подразделения|дата\s+выдачи)\s*[:—-]?",
+            author.passport_issuer,
+            maxsplit=1,
+        )[0].strip(" ,;:-")
         passport = (
-            f"Паспорт гражданина РФ, серия «{value(author.passport_series)}» "
-            f"номер «{value(author.passport_number)}», выдан "
-            f"{value(author.passport_issue_date)} {value(author.passport_issuer)}"
+            f"Паспорт гражданина РФ, серия «{passport_value(author.passport_series)}» "
+            f"номер «{passport_value(author.passport_number)}» выдан "
+            f"{passport_value(author.passport_issue_date)} {passport_value(issuer)}"
         )
-        app_number = value(data.application_number) if data.application_number else "________________"
         current_date = data.document_date.strftime("%d.%m.%Y")
         author_mention_choice = (
             "☐ упоминать его под своим именем &nbsp;&nbsp; ☒ не упоминать его (анонимно)"
@@ -534,18 +537,17 @@ class SoftwareConsentWidget(QWidget):
           <div class="right">В Федеральную службу<br>по интеллектуальной собственности<br>
           Бережковская наб., д. 30, корп. 1,<br>г. Москва, Г-59, ГСП-1, 119991,<br>Российская Федерация</div>
           <p>Название программы для ЭВМ или базы данных<br>«{value(data.program_name)}»</p>
-          <p>№ заявки {app_number}</p>
           <h3>Согласие на обработку персональных данных</h3>
           <p><span class="label">Ф. И. О. субъекта персональных данных</span> {value(author.full_name)}</p>
           <p><span class="label">Адрес места жительства</span> {value(author.address)}</p>
-          <p><span class="label">Документ, удостоверяющий личность</span><br>{passport}</p>
+          <p class="legal"><span class="label">Документ, удостоверяющий личность</span><br>{passport}</p>
           <p class="legal">Подтверждаю согласие на обработку моих персональных данных в целях
           предоставления Федеральной службой по интеллектуальной собственности государственной услуги.</p>
           <p>Подпись _________________ / {value(author.full_name)} /</p><p>{current_date}</p>
         </div>
         <div class="page">
           <h3>Согласие автора на указание сведений об авторе, указанных в заявлении</h3>
-          <p>Заявка № {app_number}<br>Название: «{value(data.program_name)}»</p>
+          <p>Название: «{value(data.program_name)}»</p>
           <p><span class="label">Правообладатель (Заявитель):</span><br>{value(data.applicant_name)}<br>
           {value(data.applicant_address)}<br>ОГРН: {value(data.ogrn)} &nbsp;&nbsp; ИНН: {value(data.inn)}</p>
           <p><span class="label">Фамилия имя отчество:</span> {value(author.full_name)}<br>

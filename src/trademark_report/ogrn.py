@@ -98,6 +98,41 @@ def extract_registered_address(text: str) -> str:
     return re.sub(r"\s*,\s*", ", ", ", ".join(parts)).strip(" ,")
 
 
+def extract_full_registration_name(text: str) -> str:
+    """Extract the full legal name from an FNS statement."""
+
+    lines = [re.sub(r"\s+", " ", line).strip() for line in text.splitlines()]
+
+    # The statement header is the most stable location: the full name is placed
+    # directly before the explanatory label and does not contain table ordinals.
+    for index, line in enumerate(lines):
+        if line.casefold() == "полное наименование юридического лица" and index:
+            value = lines[index - 1].strip(" ,")
+            if value and not re.fullmatch(r"\d+", value):
+                return value
+
+    heading = re.compile(
+        r"^(?:\d+\s+)?полное наименование(?:\s+на русском языке)?(?:\s+(.*))?$",
+        re.IGNORECASE,
+    )
+    for index, line in enumerate(lines):
+        match = heading.match(line)
+        if not match:
+            continue
+        parts: list[str] = []
+        inline_value = (match.group(1) or "").strip(" ,")
+        if inline_value:
+            parts.append(inline_value)
+        for value in lines[index + 1 :]:
+            if re.match(r"^(?:\d+\s+)?грн и дата внесения", value, re.IGNORECASE):
+                break
+            if value:
+                parts.append(value.strip(" ,"))
+        if parts:
+            return re.sub(r"\s+", " ", " ".join(parts)).strip(" ,")
+    return ""
+
+
 def _pdf_text(content: bytes) -> str:
     reader = PdfReader(BytesIO(content))
     return "\n".join(page.extract_text() or "" for page in reader.pages)
@@ -107,17 +142,17 @@ def _remaining_timeout(deadline: float) -> float:
     return max(0.5, min(8.0, deadline - time.monotonic()))
 
 
-def _fetch_address(
+def _fetch_statement_details(
     row: dict,
     client,
     headers: dict[str, str],
     timeout: float,
     *,
     attempts: int = 3,
-) -> tuple[str, str]:
+) -> tuple[str, str, str]:
     token = str(row.get("t", "")).strip()
     if not token:
-        return "", "ФНС не вернула идентификатор выписки"
+        return "", "", "ФНС не вернула идентификатор выписки"
 
     attempts = max(1, attempts)
     overall_deadline = time.monotonic() + max(timeout, 24.0)
@@ -139,7 +174,7 @@ def _fetch_address(
             )
             requested.raise_for_status()
             if requested.json().get("captchaRequired"):
-                return "", "ФНС запросила CAPTCHA"
+                return "", "", "ФНС запросила CAPTCHA"
 
             while time.monotonic() < attempt_deadline:
                 status = client.get(
@@ -166,10 +201,14 @@ def _fetch_address(
                     timeout=_remaining_timeout(attempt_deadline),
                 )
                 downloaded.raise_for_status()
-                address = extract_registered_address(_pdf_text(downloaded.content))
+                statement_text = _pdf_text(downloaded.content)
+                address = extract_registered_address(statement_text)
+                full_name = extract_full_registration_name(statement_text)
                 if address:
-                    return address, ""
+                    return address, full_name, ""
                 last_error = "в выписке не найден публичный адрес"
+                if full_name:
+                    return "", full_name, last_error
         except requests.Timeout:
             last_error = "ФНС не ответила вовремя"
         except requests.RequestException as exc:
@@ -179,7 +218,7 @@ def _fetch_address(
 
         if attempt + 1 < attempts and time.monotonic() < overall_deadline:
             time.sleep(min(1.5 * (attempt + 1), max(0.0, overall_deadline - time.monotonic())))
-    return "", last_error
+    return "", "", last_error
 
 
 def fetch_registration_data(
@@ -222,7 +261,9 @@ def fetch_registration_data(
         raise OgrnLookupError("ФНС не вернула единственный ОГРН. Введите его вручную.")
     row = exact[0]
     cached_address = _ADDRESS_CACHE.get(inn, "")
-    address, address_error = _fetch_address(row, client, headers, timeout)
+    address, full_name, address_error = _fetch_statement_details(
+        row, client, headers, timeout
+    )
     if address:
         _ADDRESS_CACHE[inn] = address
     elif cached_address:
@@ -232,7 +273,7 @@ def fetch_registration_data(
         ogrn=ogrn_values.pop(),
         address=address,
         address_error=address_error,
-        name=_registration_name(row.get("n")),
+        name=full_name or _registration_name(row.get("n")),
     )
 
 
