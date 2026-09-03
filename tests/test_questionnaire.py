@@ -244,6 +244,379 @@ def test_parser_reads_program_name_above_section_one_table(tmp_path):
     assert result.data.program_name == "Складские системы RMS"
 
 
+def test_parser_keeps_full_applicant_name_from_questionnaire(tmp_path):
+    path = tmp_path / "full-applicant-name.docx"
+    document = Document()
+    table = document.add_table(rows=0, cols=2)
+    for label, value in (
+        ("Наименование программы", "Программа управления оборудованием"),
+        ("Программа создана за счет средств:", "Собственных"),
+        (
+            "Наименование заявителя и ИНН",
+            "Общество с ограниченной ответственностью Производственное "
+            "объединение «Комплекс»,\nИНН: 6658460826",
+        ),
+        ("Количество авторов", "0"),
+    ):
+        cells = table.add_row().cells
+        cells[0].text = label
+        cells[1].text = value
+    document.save(path)
+
+    result = parse_questionnaire(path)
+
+    assert result.data.applicant_name == (
+        "Общество с ограниченной ответственностью Производственное "
+        "объединение «Комплекс»"
+    )
+    assert result.data.questionnaire_profile_id == "cp_software_2026"
+
+
+def test_parser_joins_wrapped_author_address_until_passport(tmp_path):
+    path = tmp_path / "wrapped-author-address.docx"
+    document = Document()
+    table = document.add_table(rows=0, cols=2)
+    for label, value in (
+        ("Наименование программы", "СлотПлан"),
+        ("Программа создана за счет средств:", "Собственных"),
+        ("Наименование заявителя и ИНН", "ООО «Пример», ИНН 7707083893"),
+        ("Количество авторов", "1"),
+        (
+            "Паспортные данные Автора 1",
+            "Сумароков Константин Иванович, 15.10.1985\n"
+            "РОССИЯ, 454092, Челябинская обл., г. Челябинск,\n"
+            "ул. Воровского, д. 21, кв. 39\n"
+            "Паспорт: 75 05 865736 Выдан: Управление внутренних дел "
+            "по Центральному району города Челябинска 18.04.2006",
+        ),
+        ("Описание творческого вклада Автора 1", "Разработка архитектуры"),
+    ):
+        cells = table.add_row().cells
+        cells[0].text = label
+        cells[1].text = value
+    document.save(path)
+
+    result = parse_questionnaire(path)
+
+    assert result.data.authors[0].address == (
+        "РОССИЯ, 454092, Челябинская обл., г. Челябинск, "
+        "ул. Воровского, д. 21, кв. 39"
+    )
+
+
+def test_parser_supports_issuer_in_separate_issued_by_authority_line(tmp_path):
+    path = tmp_path / "issued-by-authority.docx"
+    document = Document()
+    table = document.add_table(rows=0, cols=2)
+    for label, value in (
+        ("Наименование программы", "ATLAS MONITORING"),
+        ("Программа создана за счет средств:", "Собственных"),
+        (
+            "Наименование заявителя и ИНН",
+            "ООО «Электронные и программные системы», ИНН 6658302724",
+        ),
+        ("Количество авторов", "1"),
+        (
+            "Паспортные данные Автора 1",
+            "ФИО - Пахомов Артем Валерьевич\n"
+            "Дата рождения - 10.02.2004\n"
+            "Адрес места жительства - г. Екатеринбург, ул. Академика Бардина, д. 41\n"
+            "Серия и номер паспорта – 65 24 007573\n"
+            "дата выдачи – 02.04.2024\n"
+            "выдавший орган – ГУ МВД РОССИИ ПО СВЕРДЛОВСКОЙ ОБЛАСТИ",
+        ),
+        ("Описание творческого вклада Автора 1", "Разработка программы"),
+    ):
+        cells = table.add_row().cells
+        cells[0].text = label
+        cells[1].text = value
+    document.save(path)
+
+    result = parse_questionnaire(path)
+
+    author = result.data.authors[0]
+    assert author.passport_issue_date == "02.04.2024"
+    assert author.passport_issuer == "ГУ МВД РОССИИ ПО СВЕРДЛОВСКОЙ ОБЛАСТИ"
+    assert not any("кем выдан" in warning for warning in result.warnings)
+
+
+def test_parser_removes_issuer_field_labels_from_value(tmp_path):
+    path = tmp_path / "issuer-field-label.docx"
+    document = Document()
+    table = document.add_table(rows=0, cols=2)
+    for label, value in (
+        ("Наименование программы", "Пример"),
+        ("Программа создана за счет средств:", "Собственных"),
+        ("Количество авторов", "1"),
+        (
+            "Паспортные данные Автора 1",
+            "Иванов Иван Иванович, 01.01.1990\n"
+            "серия 6501, номер 123456, дата выдачи 01.02.2010, "
+            "орган, выдавший документ: орган МВД РОССИИ\n"
+            "адрес: г. Москва, д. 1",
+        ),
+        ("Описание творческого вклада Автора 1", "Разработка программы"),
+    ):
+        cells = table.add_row().cells
+        cells[0].text = label
+        cells[1].text = value
+    document.save(path)
+
+    author = parse_questionnaire(path).data.authors[0]
+
+    assert author.passport_issuer == "МВД РОССИИ"
+
+
+def test_parser_extracts_issuer_before_date_and_ignores_subdivision_code(tmp_path):
+    path = tmp_path / "issuer-before-date.docx"
+    document = Document()
+    table = document.add_table(rows=0, cols=2)
+    for label, value in (
+        ("Наименование программы", "LLM Agent"),
+        ("Программа создана за счет средств:", "Собственных"),
+        ("Наименование заявителя и ИНН", "ООО «Пример», ИНН 7707083893"),
+        ("Количество авторов", "2"),
+        (
+            "Паспортные данные Автора 1",
+            "Горбатюк Дмитрий Петрович\n14.02.1977\n"
+            "Г. Екатеринбург ул. Белинского д.161 кв 171,\n"
+            "паспорт РФ 65 21 463031 ГУ МВД России по Свердловской области "
+            "22.02.2022 660-003",
+        ),
+        ("Описание творческого вклада Автора 1", "Разработка алгоритма"),
+        (
+            "Паспортные данные Автора 2",
+            "Горбатюк Олег Дмитриевич\n20.06.2004\n"
+            "Г. Екатеринбург ул. Белинского д.161 кв 171\n"
+            "Паспорт 65 24 080095 ГУ МВД России по Свердловской области "
+            "06.08.2024 660-002",
+        ),
+        ("Описание творческого вклада Автора 2", "Разработка программы"),
+    ):
+        cells = table.add_row().cells
+        cells[0].text = label
+        cells[1].text = value
+    document.save(path)
+
+    result = parse_questionnaire(path)
+
+    assert [author.passport_issuer for author in result.data.authors] == [
+        "ГУ МВД России по Свердловской области",
+        "ГУ МВД России по Свердловской области",
+    ]
+    assert [author.passport_issue_date for author in result.data.authors] == [
+        "22.02.2022",
+        "06.08.2024",
+    ]
+
+
+def test_parser_splits_grouped_authors_with_their_contributions(tmp_path):
+    path = tmp_path / "grouped-authors.docx"
+    document = Document()
+    table = document.add_table(rows=0, cols=2)
+    for label, value in (
+        ("Наименование программы", "Программный комплекс"),
+        ("Программа создана за счет средств:", "Собственных"),
+        ("Наименование заявителя и ИНН", "ООО «Пример», ИНН 7707083893"),
+        ("Количество авторов", "2"),
+        (
+            "Паспортные данные Автора 1\nОписание творческого вклада Автора 1",
+            "1. Иванов Иван Иванович\n"
+            "01.01.1990 г.р., паспорт 6501 123456, выдан МВД России "
+            "01.02.2010, зарегистрирован г. Екатеринбург, ул. Ленина, д. 1\n"
+            "- Разработка архитектуры программы\n"
+            "2. Петров Петр Петрович\n"
+            "02.02.1992 г.р., паспорт выдан УФМС России 03.03.2012, "
+            "Код подразделения 660-001, серия 6502 No 654321, "
+            "адрес: г. Екатеринбург, ул. Мира, д. 2\n"
+            "- Написание исходного кода программы",
+        ),
+        (
+            "Паспортные данные Автора 1\nОписание творческого вклада Автора 1",
+            "Иванов Иван Иванович - Разработка архитектуры программы.\n"
+            "Петров Петр Петрович - Написание исходного кода программы.",
+        ),
+    ):
+        cells = table.add_row().cells
+        cells[0].text = label
+        cells[1].text = value
+    document.save(path)
+
+    result = parse_questionnaire(path)
+
+    assert len(result.data.authors) == 2
+    first, second = result.data.authors
+    assert first.full_name == "Иванов Иван Иванович"
+    assert first.creative_contribution == "Разработка архитектуры программы"
+    assert first.address == "г. Екатеринбург, ул. Ленина, д. 1"
+    assert second.full_name == "Петров Петр Петрович"
+    assert second.creative_contribution == "Написание исходного кода программы"
+    assert (second.passport_series, second.passport_number) == ("6502", "654321")
+    assert second.passport_issuer == "УФМС России"
+    assert second.address == "г. Екатеринбург, ул. Мира, д. 2"
+
+
+def test_parser_splits_grouped_passport_headings_and_applies_shared_fields(tmp_path):
+    path = tmp_path / "grouped-passport-headings.docx"
+    document = Document()
+    table = document.add_table(rows=0, cols=2)
+    for label, value in (
+        ("Наименование программы", "Платформа скоринга"),
+        ("Программа создана за счет средств:", "Собственных"),
+        ("Наименование заявителя и ИНН", "ООО «Пример», ИНН 7707083893"),
+        ("Количество авторов", "2"),
+        (
+            "Паспортные данные Автора 1 / Описание творческого вклада Автора 1",
+            "Паспортные данные Автора 1*\n"
+            "- Иванов Иван Иванович;\n"
+            "- 01.01.1990;\n"
+            "- Россия, г. Екатеринбург, ул. Ленина, д. 1;\n"
+            "- серия 6501 и номер 123456 паспорта, дата выдачи 01.02.2010 МВД России\n"
+            "Паспортные данные Автора 2*\n"
+            "- Петров Петр Петрович;\n"
+            "- 02.02.1992;\n"
+            "- Россия, г. Екатеринбург, ул. Мира, д. 2;\n"
+            "- серия 6502 и номер 654321 паспорта, дата выдачи 03.04.2012 УФМС России",
+        ),
+        (
+            "Паспортные данные Автора 1 / Описание творческого вклада Автора 1",
+            "- написание исходного текста программы;\n- разработка алгоритма",
+        ),
+        (
+            "Основание возникновения права (указывается для каждого автора)",
+            "- заявитель является работодателем автора",
+        ),
+    ):
+        cells = table.add_row().cells
+        cells[0].text = label
+        cells[1].text = value
+    document.save(path)
+
+    result = parse_questionnaire(path)
+
+    assert len(result.data.authors) == 2
+    first, second = result.data.authors
+    assert (first.full_name, first.passport_series, first.passport_number) == (
+        "Иванов Иван Иванович", "6501", "123456"
+    )
+    assert (second.full_name, second.passport_series, second.passport_number) == (
+        "Петров Петр Петрович", "6502", "654321"
+    )
+    assert first.creative_contribution == second.creative_contribution == (
+        "написание исходного текста программы; разработка алгоритма"
+    )
+    assert first.rights_basis == second.rights_basis == (
+        "заявитель является работодателем автора"
+    )
+
+
+def test_numbered_contributions_fill_existing_grouped_authors(tmp_path):
+    path = tmp_path / "grouped-authors-separate-contributions.docx"
+    document = Document()
+    table = document.add_table(rows=0, cols=2)
+    for label, value in (
+        ("Наименование программы", "Террамаркет"),
+        ("Программа создана за счет средств:", "Собственных"),
+        ("Количество авторов", "2"),
+        (
+            "Паспортные данные Автора 1 / Описание творческого вклада Автора 1",
+            "Авторы:\n"
+            "1. Иванов Иван Иванович\nПаспорт 6501 123456 выдан МВД России\n"
+            "Дата выдачи 01.02.2010\nМесто жительства: г. Москва, д. 1\n"
+            "Дата рождения: 01.01.1990\n"
+            "2. Петров Петр Петрович\nПаспорт 6502 654321 выдан УФМС России\n"
+            "Дата выдачи 03.04.2012\nМесто жительства: г. Москва, д. 2\n"
+            "Дата рождения: 02.02.1992",
+        ),
+        (
+            "Паспортные данные Автора 1 / Описание творческого вклада Автора 1",
+            "1. Иванов Иван Иванович\n- разработка алгоритма\n"
+            "2. Петров Петр Петрович\n- написание исходного кода",
+        ),
+    ):
+        cells = table.add_row().cells
+        cells[0].text = label
+        cells[1].text = value
+    document.save(path)
+
+    result = parse_questionnaire(path)
+
+    assert len(result.data.authors) == 2
+    first, second = result.data.authors
+    assert first.creative_contribution == "разработка алгоритма"
+    assert second.creative_contribution == "написание исходного кода"
+    assert first.address == "г. Москва, д. 1"
+    assert second.address == "г. Москва, д. 2"
+
+
+def test_parser_supports_colons_after_passport_series_and_issued_labels(tmp_path):
+    path = tmp_path / "colon-separated-passport.docx"
+    document = Document()
+    table = document.add_table(rows=0, cols=2)
+    for label, value in (
+        ("Наименование программы", "Программа управления оборудованием"),
+        ("Программа создана за счет средств:", "Собственных"),
+        ("Наименование заявителя и ИНН", "ООО «Пример», ИНН 7707083893"),
+        ("Количество авторов", "1"),
+        (
+            "Паспортные данные Автора 1",
+            "Иванов Кирилл Олегович,\n"
+            "дата рождения: 22.07.2000\n"
+            "паспорт серия: 80 25 № 110704,\n"
+            "дата выдачи - 05.08.2020,\n"
+            "выдан: МВД ПО РЕСПУБЛИКЕ БАШКОРТОСТАН,\n"
+            "зарегистрирован: 450000, Республика Башкортостан, г. Уфа, ул. Ленина, д. 1",
+        ),
+        ("Описание творческого вклада автора 1", "Разработка программы"),
+    ):
+        cells = table.add_row().cells
+        cells[0].text = label
+        cells[1].text = value
+    document.save(path)
+
+    author = parse_questionnaire(path).data.authors[0]
+
+    assert author.passport_series == "8025"
+    assert author.passport_number == "110704"
+    assert author.passport_issue_date == "05.08.2020"
+    assert author.passport_issuer == "МВД ПО РЕСПУБЛИКЕ БАШКОРТОСТАН"
+    assert author.address == (
+        "450000, Республика Башкортостан, г. Уфа, ул. Ленина, д. 1"
+    )
+
+
+def test_parser_supports_year_first_text_birth_date(tmp_path):
+    path = tmp_path / "year-first-birth-date.docx"
+    document = Document()
+    table = document.add_table(rows=0, cols=2)
+    for label, value in (
+        ("Наименование программы", "Программа управления оборудованием"),
+        ("Программа создана за счет средств:", "Собственных"),
+        ("Наименование заявителя и ИНН", "ООО «Пример», ИНН 7707083893"),
+        ("Количество авторов", "1"),
+        (
+            "Паспортные данные Автора 1",
+            "- Петров Сергей Вячеславович;\n"
+            "- 1982 г. 3 января\n"
+            "- г. Екатеринбург, ул. Гражданская, д. 11, кв. 29\n"
+            "- Паспорт: серия 6520, номер 187894; "
+            "Дата выдачи 24.11.2020; "
+            "Выдан ГУ МВД России по Свердловской области",
+        ),
+        ("Описание творческого вклада автора 1", "Разработка программы"),
+    ):
+        cells = table.add_row().cells
+        cells[0].text = label
+        cells[1].text = value
+    document.save(path)
+
+    author = parse_questionnaire(path).data.authors[0]
+
+    assert author.birth_date == "03.01.1982"
+    assert author.address == "г. Екатеринбург, ул. Гражданская, д. 11, кв. 29"
+    assert author.passport_issue_date == "24.11.2020"
+
+
 def test_parser_does_not_warn_about_passport_data_when_authors_are_not_mentioned(tmp_path):
     path = tmp_path / "authors-not-mentioned.docx"
     document = Document()

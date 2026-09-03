@@ -8,6 +8,7 @@ from trademark_report.ogrn import (
     extract_registered_address,
     fetch_ogrn,
     fetch_registration_data,
+    prefer_full_registration_name,
     validate_inn,
 )
 
@@ -93,6 +94,48 @@ def test_full_registration_name_parser_handles_table_layout():
     assert extract_full_registration_name(text) == (
         'ОБЩЕСТВО С ОГРАНИЧЕННОЙ ОТВЕТСТВЕННОСТЬЮ "СКЛАДСКИЕ СИСТЕМЫ"'
     )
+
+
+def test_full_registration_name_parser_joins_wrapped_statement_header():
+    text = """
+    дата формирования выписки
+    Настоящая выписка содержит сведения о юридическом лице
+    ОБЩЕСТВО С ОГРАНИЧЕННОЙ ОТВЕТСТВЕННОСТЬЮ ПРОИЗВОДСТВЕННОЕ
+    ОБЪЕДИНЕНИЕ "КОМПЛЕКС"
+    полное наименование юридического лица
+    ОГРН 1 1 4 6 6 5 8 0 1 4 4 0 3
+    """
+
+    assert extract_full_registration_name(text) == (
+        'ОБЩЕСТВО С ОГРАНИЧЕННОЙ ОТВЕТСТВЕННОСТЬЮ ПРОИЗВОДСТВЕННОЕ '
+        'ОБЪЕДИНЕНИЕ "КОМПЛЕКС"'
+    )
+
+
+def test_full_registration_name_parser_handles_wrapped_header_phrase():
+    text = """
+    Настоящая выписка содержит сведения о юридическом
+    лице
+    АКЦИОНЕРНОЕ ОБЩЕСТВО «ВСЕРОССИЙСКИЙ НАУЧНО-ИССЛЕДОВАТЕЛЬСКИЙ
+    ИНСТИТУТ»
+    полное наименование юридического лица
+    """
+
+    assert extract_full_registration_name(text) == (
+        "АКЦИОНЕРНОЕ ОБЩЕСТВО «ВСЕРОССИЙСКИЙ НАУЧНО-ИССЛЕДОВАТЕЛЬСКИЙ "
+        "ИНСТИТУТ»"
+    )
+
+
+def test_more_complete_questionnaire_name_is_not_replaced_by_fns_fragment():
+    full = (
+        "АКЦИОНЕРНОЕ ОБЩЕСТВО «ИНСТИТУТ ОБОРУДОВАНИЯ "
+        "НЕФТЕПЕРЕРАБАТЫВАЮЩЕЙ ПРОМЫШЛЕННОСТИ»"
+    )
+    fragment = 'НЕФТЕПЕРЕРАБАТЫВАЮЩЕЙ ПРОМЫШЛЕННОСТИ"'
+
+    assert prefer_full_registration_name(full, fragment) == full
+    assert prefer_full_registration_name("ООО «Тест»", full) == full
 
 
 def test_address_parser_does_not_return_unrelated_statement_text():

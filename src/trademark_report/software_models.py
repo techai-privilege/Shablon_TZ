@@ -52,6 +52,8 @@ class SoftwareConsentData:
     authors_will_be_mentioned: bool | None = None
     declared_author_count: int | None = None
     source_path: str = ""
+    questionnaire_profile_id: str = ""
+    questionnaire_profile_name: str = ""
 
     def missing_common_fields(self) -> list[str]:
         labels = {

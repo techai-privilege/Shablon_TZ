@@ -43,6 +43,30 @@ def _registration_name(value: object) -> str:
     return re.sub(r"\s+", " ", text).strip(" ,;")
 
 
+def prefer_full_registration_name(current: str, fetched: str) -> str:
+    """Prefer the more complete name when one source returns only its fragment."""
+
+    current = re.sub(r"\s+", " ", current or "").strip()
+    fetched = re.sub(r"\s+", " ", fetched or "").strip()
+    if not current:
+        return fetched
+    if not fetched:
+        return current
+
+    def comparable(value: str) -> str:
+        value = value.casefold().replace("ё", "е")
+        value = value.translate(str.maketrans({"«": '"', "»": '"', "„": '"', "“": '"'}))
+        return re.sub(r"[^0-9a-zа-я]+", " ", value).strip()
+
+    current_key = comparable(current)
+    fetched_key = comparable(fetched)
+    if fetched_key and fetched_key in current_key and len(fetched_key) < len(current_key):
+        return current
+    if current_key and current_key in fetched_key and len(current_key) < len(fetched_key):
+        return fetched
+    return fetched
+
+
 def _valid_checksum(digits: str) -> bool:
     numbers = [int(item) for item in digits]
     if len(numbers) == 10:
@@ -104,12 +128,36 @@ def extract_full_registration_name(text: str) -> str:
     lines = [re.sub(r"\s+", " ", line).strip() for line in text.splitlines()]
 
     # The statement header is the most stable location: the full name is placed
-    # directly before the explanatory label and does not contain table ordinals.
+    # before the explanatory label and may wrap across several PDF text lines.
     for index, line in enumerate(lines):
         if line.casefold() == "полное наименование юридического лица" and index:
-            value = lines[index - 1].strip(" ,")
+            marker_index = next(
+                (
+                    previous
+                    for previous in range(index - 1, -1, -1)
+                    if lines[previous].casefold().startswith(
+                        "настоящая выписка содержит сведения"
+                    )
+                ),
+                None,
+            )
+            if marker_index is not None:
+                header = " ".join(
+                    item.strip(" ,")
+                    for item in lines[marker_index:index]
+                    if item.strip(" ,")
+                )
+                value = re.sub(
+                    r"^настоящая\s+выписка\s+содержит\s+сведения\s+"
+                    r"о\s+юридическом\s+лице\s*",
+                    "",
+                    header,
+                    flags=re.IGNORECASE,
+                )
+            else:
+                value = lines[index - 1].strip(" ,")
             if value and not re.fullmatch(r"\d+", value):
-                return value
+                return re.sub(r"\s+", " ", value).strip(" ,")
 
     heading = re.compile(
         r"^(?:\d+\s+)?полное наименование(?:\s+на русском языке)?(?:\s+(.*))?$",

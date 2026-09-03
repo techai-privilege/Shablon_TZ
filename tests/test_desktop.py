@@ -175,6 +175,33 @@ def test_fns_result_replaces_short_applicant_name_with_full_name():
     application.processEvents()
 
 
+def test_fns_result_does_not_replace_full_applicant_name_with_its_fragment():
+    application = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    page = window.software_page
+    full_name = (
+        "АКЦИОНЕРНОЕ ОБЩЕСТВО «ИНСТИТУТ ОБОРУДОВАНИЯ "
+        "НЕФТЕПЕРЕРАБАТЫВАЮЩЕЙ ПРОМЫШЛЕННОСТИ»"
+    )
+    page.inn.setText("7707083893")
+    page.applicant_name.setText(full_name)
+    page._ogrn_lookup_inn = "7707083893"
+
+    page._ogrn_received(
+        FnsRegistrationData(
+            ogrn="1027700132195",
+            name='НЕФТЕПЕРЕРАБАТЫВАЮЩЕЙ ПРОМЫШЛЕННОСТИ"',
+        )
+    )
+
+    assert page.applicant_name.text() == full_name
+    assert page.applicant_name.cursorPosition() == 0
+    assert page.applicant_name.toolTip() == full_name
+
+    window.close()
+    application.processEvents()
+
+
 def test_edited_conclusion_is_passed_to_report_data():
     application = QApplication.instance() or QApplication([])
     window = MainWindow()

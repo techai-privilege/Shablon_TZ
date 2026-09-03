@@ -29,7 +29,12 @@ from PySide6.QtWidgets import (
 )
 
 from .consent_document import DEFAULT_CONSENT_TEMPLATE, save_author_consents
-from .ogrn import FnsRegistrationData, OgrnLookupError, fetch_registration_data
+from .ogrn import (
+    FnsRegistrationData,
+    OgrnLookupError,
+    fetch_registration_data,
+    prefer_full_registration_name,
+)
 from .questionnaire import parse_questionnaire
 from .software_models import SoftwareAuthor, SoftwareConsentData
 
@@ -147,6 +152,8 @@ class SoftwareConsentWidget(QWidget):
         self._ogrn_lookup_inn = ""
         self._warnings: list[str] = []
         self._authors_will_be_mentioned: bool | None = None
+        self._questionnaire_profile_id = ""
+        self._questionnaire_profile_name = ""
         self._build_ui()
         self.add_author(SoftwareAuthor())
         self._refresh_preview()
@@ -157,7 +164,7 @@ class SoftwareConsentWidget(QWidget):
         heading.setProperty("title", True)
         subtitle = QLabel(
             "Загрузите заполненную анкету. Программа обработает только раздел I, "
-            "создаст карточки авторов и подготовит общий DOCX."
+            "создаст карточки авторов и подготовит отдельный DOCX для каждого автора."
         )
         subtitle.setWordWrap(True)
         subtitle.setProperty("subtitle", True)
@@ -287,16 +294,24 @@ class SoftwareConsentWidget(QWidget):
             QMessageBox.critical(self, "Не удалось прочитать анкету", str(exc))
             return
         self.source_label.setText(Path(path).name)
+        self.source_label.setToolTip(
+            f"Профиль анкеты: {result.data.questionnaire_profile_name}"
+        )
         self.set_data(result.data)
         self._show_warnings(result.warnings)
-        self.status_message.emit(f"Анкета загружена: {Path(path).name}")
+        self.status_message.emit(
+            f"Анкета загружена: {Path(path).name}; "
+            f"профиль: {result.data.questionnaire_profile_name}"
+        )
         if result.data.inn:
             self.lookup_ogrn(silent=True)
 
     def set_data(self, data: SoftwareConsentData) -> None:
         self._authors_will_be_mentioned = data.authors_will_be_mentioned
+        self._questionnaire_profile_id = data.questionnaire_profile_id
+        self._questionnaire_profile_name = data.questionnaire_profile_name
         self.program_name.setText(data.program_name)
-        self.applicant_name.setText(data.applicant_name)
+        self._set_applicant_name(data.applicant_name)
         self.applicant_address.setPlainText(data.applicant_address)
         self.inn.setText(data.inn)
         self.ogrn.setText(data.ogrn)
@@ -381,6 +396,7 @@ class SoftwareConsentWidget(QWidget):
 
     @Slot()
     def _applicant_name_changed(self) -> None:
+        self.applicant_name.setToolTip(self.applicant_name.text().strip())
         if self.applicant_name.text().strip():
             remaining = [
                 warning
@@ -390,6 +406,12 @@ class SoftwareConsentWidget(QWidget):
             if remaining != self._warnings:
                 self._show_warnings(remaining)
         self._refresh_preview()
+
+    def _set_applicant_name(self, value: str) -> None:
+        """Set a long name without leaving the one-line editor scrolled to its end."""
+
+        self.applicant_name.setText(value)
+        self.applicant_name.setCursorPosition(0)
 
     @Slot()
     def lookup_ogrn(self, *, silent: bool = False) -> None:
@@ -434,7 +456,10 @@ class SoftwareConsentWidget(QWidget):
             self.ogrn.setText(result.ogrn)
             received = ["ОГРН"]
             if result.name:
-                self.applicant_name.setText(result.name)
+                name = prefer_full_registration_name(
+                    self.applicant_name.text(), result.name
+                )
+                self._set_applicant_name(name)
                 received.append("наименование заявителя")
             if result.address:
                 self.applicant_address.setPlainText(result.address)
@@ -475,6 +500,8 @@ class SoftwareConsentWidget(QWidget):
             authors=[editor.value() for editor in self.author_editors],
             authors_will_be_mentioned=self._authors_will_be_mentioned,
             source_path=self.source_label.text() if self.source_label.text() != "Анкета не загружена" else "",
+            questionnaire_profile_id=self._questionnaire_profile_id,
+            questionnaire_profile_name=self._questionnaire_profile_name,
         )
 
     def validation_errors(self) -> list[str]:
