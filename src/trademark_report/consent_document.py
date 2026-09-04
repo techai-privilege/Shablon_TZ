@@ -101,6 +101,30 @@ def _remove_paragraph(paragraph) -> None:
         parent.remove(element)
 
 
+def _remove_blank_paragraph_before_second_page_table(document: DocumentType) -> None:
+    """Remove the template spacer left between its page break and main table."""
+
+    if not document.tables:
+        return
+    table_element = document.tables[0]._tbl
+    blank_paragraph = table_element.getprevious()
+    page_break_paragraph = (
+        blank_paragraph.getprevious() if blank_paragraph is not None else None
+    )
+    if (
+        blank_paragraph is None
+        or blank_paragraph.tag != qn("w:p")
+        or "".join(blank_paragraph.itertext()).strip()
+        or blank_paragraph.findall(f".//{qn('w:br')}")
+        or page_break_paragraph is None
+        or page_break_paragraph.tag != qn("w:p")
+    ):
+        return
+    page_breaks = page_break_paragraph.findall(f".//{qn('w:br')}")
+    if any(item.get(qn("w:type")) == "page" for item in page_breaks):
+        blank_paragraph.getparent().remove(blank_paragraph)
+
+
 def _expand_table_width(table, extra_width=TABLE_WIDTH_EXTENSION) -> None:
     """Expand a fixed-width template table while preserving column proportions."""
 
@@ -272,6 +296,7 @@ def _fill_author_document(
     # The template reserves a very tall final row for the attorney/date block.
     # A smaller minimum keeps long, unabridged author contributions on page 2.
     if document.tables and len(document.tables[0].rows) >= 6:
+        _remove_blank_paragraph_before_second_page_table(document)
         _expand_table_width(document.tables[0])
         # Reclaim a small amount of unused vertical padding in the title row.
         # This keeps the form on two pages after enlarging both signature areas.

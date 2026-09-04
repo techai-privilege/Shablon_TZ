@@ -4,7 +4,7 @@ from typing import Any, cast
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QStandardPaths
+from PySide6.QtCore import QStandardPaths, QThread
 from PySide6.QtWidgets import QApplication, QMessageBox, QPushButton, QScrollArea
 
 from app import BackgroundWidget, MainWindow, RecordCard
@@ -365,7 +365,12 @@ def test_consent_documents_are_saved_without_blocking_the_ui(monkeypatch, tmp_pa
         )
     )
     monkeypatch.setattr(QStandardPaths, "writableLocation", lambda *_: str(tmp_path))
-    monkeypatch.setattr(QMessageBox, "information", lambda *args, **kwargs: None)
+    information_threads: list[QThread] = []
+    monkeypatch.setattr(
+        QMessageBox,
+        "information",
+        lambda *args, **kwargs: information_threads.append(QThread.currentThread()),
+    )
     monkeypatch.setattr(QMessageBox, "critical", lambda *args, **kwargs: None)
 
     page.save_document()
@@ -378,7 +383,43 @@ def test_consent_documents_are_saved_without_blocking_the_ui(monkeypatch, tmp_pa
     application.processEvents()
     assert page._save_thread is None
     assert page.save_button.isEnabled()
+    assert information_threads == [application.thread()]
     assert (tmp_path / "Согласие Иванов Иван Иванович.docx").is_file()
+
+    window.close()
+    application.processEvents()
+
+
+def test_ogrn_lookup_error_dialog_is_shown_on_gui_thread(monkeypatch):
+    application = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    page = window.software_page
+    page.applicant_name.setText("ООО «Тест»")
+    page.inn.setText("7707083893")
+
+    def fail_lookup(_inn: str):
+        raise RuntimeError("Ошибка тестового запроса")
+
+    warning_threads: list[QThread] = []
+    monkeypatch.setattr(
+        "trademark_report.software_widget.fetch_registration_data", fail_lookup
+    )
+    monkeypatch.setattr(
+        QMessageBox,
+        "warning",
+        lambda *args, **kwargs: warning_threads.append(QThread.currentThread()),
+    )
+
+    page.lookup_ogrn()
+
+    deadline = time.monotonic() + 10
+    while page._ogrn_thread is not None and time.monotonic() < deadline:
+        application.processEvents()
+        time.sleep(0.01)
+    application.processEvents()
+
+    assert page._ogrn_thread is None
+    assert warning_threads == [application.thread()]
 
     window.close()
     application.processEvents()

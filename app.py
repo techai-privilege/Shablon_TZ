@@ -316,8 +316,12 @@ class RecordCard(QGroupBox):
         self._worker = FetchWorker(url, self.kind)
         self._worker.moveToThread(self._thread)
         self._thread.started.connect(self._worker.run)
-        self._worker.finished.connect(self._apply_source)
-        self._worker.failed.connect(self._fetch_failed)
+        self._worker.finished.connect(
+            self._apply_source, Qt.ConnectionType.QueuedConnection
+        )
+        self._worker.failed.connect(
+            self._fetch_failed, Qt.ConnectionType.QueuedConnection
+        )
         self._worker.finished.connect(self._thread.quit)
         self._worker.failed.connect(self._thread.quit)
         self._thread.finished.connect(self._worker.deleteLater)

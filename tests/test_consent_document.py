@@ -127,6 +127,14 @@ def test_combined_consents_preserve_template_and_remove_comments(tmp_path):
     title_row_height = document.tables[0].rows[2]._tr.trPr.find(qn("w:trHeight"))
     assert title_row_height.get(qn("w:val")) == "900"
 
+    table_element = document.tables[0]._tbl
+    page_break_paragraph = table_element.getprevious()
+    assert page_break_paragraph.tag == qn("w:p")
+    assert any(
+        item.get(qn("w:type")) == "page"
+        for item in page_break_paragraph.findall(f".//{qn('w:br')}")
+    )
+
     for table in document.tables:
         following_element = table._tbl.getnext()
         assert following_element.tag == qn("w:p")

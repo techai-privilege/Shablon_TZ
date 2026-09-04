@@ -190,9 +190,11 @@ class SoftwareConsentWidget(QWidget):
         self._ogrn_thread: QThread | None = None
         self._ogrn_worker: OgrnWorker | None = None
         self._ogrn_lookup_inn = ""
+        self._ogrn_lookup_silent = False
         self._pending_ogrn_lookup: tuple[str, bool] | None = None
         self._save_thread: QThread | None = None
         self._save_worker: ConsentSaveWorker | None = None
+        self._save_output_directory: Path | None = None
         self._warnings: list[str] = []
         self._authors_will_be_mentioned: bool | None = None
         self._questionnaire_profile_id = ""
@@ -533,12 +535,17 @@ class SoftwareConsentWidget(QWidget):
         self.ogrn_button.setText("Поиск…")
         self.status_message.emit("Получаю ОГРН и адрес по ИНН из ФНС…")
         self._ogrn_lookup_inn = re.sub(r"\D", "", inn)
+        self._ogrn_lookup_silent = silent
         self._ogrn_thread = QThread(self)
         self._ogrn_worker = OgrnWorker(inn)
         self._ogrn_worker.moveToThread(self._ogrn_thread)
         self._ogrn_thread.started.connect(self._ogrn_worker.run)
-        self._ogrn_worker.finished.connect(self._ogrn_received)
-        self._ogrn_worker.failed.connect(lambda message: self._ogrn_failed(message, silent))
+        self._ogrn_worker.finished.connect(
+            self._ogrn_received, Qt.ConnectionType.QueuedConnection
+        )
+        self._ogrn_worker.failed.connect(
+            self._ogrn_failed, Qt.ConnectionType.QueuedConnection
+        )
         self._ogrn_worker.finished.connect(self._ogrn_thread.quit)
         self._ogrn_worker.failed.connect(self._ogrn_thread.quit)
         self._ogrn_thread.finished.connect(self._ogrn_worker.deleteLater)
@@ -594,9 +601,10 @@ class SoftwareConsentWidget(QWidget):
         else:
             self._finish_ogrn("ИНН изменился во время поиска — результат ФНС не применён.")
 
-    def _ogrn_failed(self, message: str, silent: bool) -> None:
+    @Slot(str)
+    def _ogrn_failed(self, message: str) -> None:
         self._finish_ogrn("ОГРН не получен — его можно ввести вручную.")
-        if not silent:
+        if not self._ogrn_lookup_silent:
             QMessageBox.warning(self, "Не удалось получить ОГРН", message)
 
     def _finish_ogrn(self, message: str) -> None:
@@ -752,14 +760,17 @@ class SoftwareConsentWidget(QWidget):
         self.save_button.setEnabled(False)
         self.save_button.setText("Формирование…")
         self.status_message.emit("Формирую согласия…")
+        self._save_output_directory = desktop
         self._save_thread = QThread(self)
         self._save_worker = ConsentSaveWorker(data, desktop, self.template_path)
         self._save_worker.moveToThread(self._save_thread)
         self._save_thread.started.connect(self._save_worker.run)
         self._save_worker.finished.connect(
-            lambda paths: self._documents_saved(paths, desktop)
+            self._documents_saved, Qt.ConnectionType.QueuedConnection
         )
-        self._save_worker.failed.connect(self._documents_save_failed)
+        self._save_worker.failed.connect(
+            self._documents_save_failed, Qt.ConnectionType.QueuedConnection
+        )
         self._save_worker.finished.connect(self._save_thread.quit)
         self._save_worker.failed.connect(self._save_thread.quit)
         self._save_thread.finished.connect(self._save_worker.deleteLater)
@@ -767,7 +778,9 @@ class SoftwareConsentWidget(QWidget):
         self._save_thread.finished.connect(self._save_thread_finished)
         self._save_thread.start()
 
-    def _documents_saved(self, paths: list[Path], desktop: Path) -> None:
+    @Slot(object)
+    def _documents_saved(self, paths: list[Path]) -> None:
+        desktop = self._save_output_directory or Path.home() / "Desktop"
         self.status_message.emit(
             f"Создано согласий: {len(paths)}. Папка: {desktop}"
         )
@@ -785,5 +798,6 @@ class SoftwareConsentWidget(QWidget):
     def _save_thread_finished(self) -> None:
         self._save_worker = None
         self._save_thread = None
+        self._save_output_directory = None
         self.save_button.setEnabled(True)
         self.save_button.setText("Сформировать согласия на рабочий стол")
