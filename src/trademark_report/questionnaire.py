@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
-from collections import defaultdict
-from pathlib import Path
 import re
+from collections import defaultdict
+from datetime import date
+from pathlib import Path
+from zipfile import BadZipFile, ZipFile
 
 from docx import Document
+from docx.document import Document as DocumentType
 
 from .questionnaire_profiles import (
     QuestionnaireProfile,
@@ -14,8 +17,12 @@ from .questionnaire_profiles import (
     default_profile_library,
     normalize_label,
 )
-from .software_models import QuestionnaireParseResult, SoftwareAuthor, SoftwareConsentData
-
+from .software_models import (
+    QuestionnaireParseResult,
+    SoftwareAuthor,
+    SoftwareConsentData,
+    detect_applicant_type,
+)
 
 DATE_RE = re.compile(r"\b(\d{2}\.\d{2}\.\d{4})\s*(?:г\.?|года)?", re.IGNORECASE)
 TEXT_DATE_RE = re.compile(
@@ -49,6 +56,29 @@ NAME_RE = re.compile(
     r"[А-ЯЁ][а-яё-]+(?:-[А-ЯЁ][а-яё-]+)?\s+"
     r"[А-ЯЁ][а-яё-]+(?:-[А-ЯЁ][а-яё-]+)?)\b"
 )
+MAX_QUESTIONNAIRE_FILE_BYTES = 50 * 1024 * 1024
+MAX_QUESTIONNAIRE_UNPACKED_BYTES = 250 * 1024 * 1024
+MAX_AUTHORS = 100
+
+
+def _validate_questionnaire_file(source: Path) -> None:
+    """Reject unsupported, damaged and unreasonably large questionnaire files."""
+
+    if source.suffix.casefold() != ".docx":
+        raise ValueError("Поддерживаются только анкеты в формате DOCX.")
+    try:
+        file_size = source.stat().st_size
+    except OSError as exc:
+        raise ValueError(f"Не удалось открыть анкету: {exc}") from exc
+    if file_size > MAX_QUESTIONNAIRE_FILE_BYTES:
+        raise ValueError("Анкета слишком большая для безопасной обработки (\u0431олее 50 МБ).")
+    try:
+        with ZipFile(source) as archive:
+            unpacked_size = sum(item.file_size for item in archive.infolist())
+    except BadZipFile as exc:
+        raise ValueError("Файл не является исправным DOCX-документом.") from exc
+    if unpacked_size > MAX_QUESTIONNAIRE_UNPACKED_BYTES:
+        raise ValueError("Внутренний размер анкеты слишком велик для безопасной обработки.")
 
 
 def _clean(value: str) -> str:
@@ -84,7 +114,7 @@ def _rows(
     return result
 
 
-def _document_labels(document: Document) -> list[str]:
+def _document_labels(document: DocumentType) -> list[str]:
     labels = []
     for table in document.tables:
         for row in table.rows:
@@ -96,7 +126,7 @@ def _document_labels(document: Document) -> list[str]:
 
 
 def _section_one_rows(
-    document: Document,
+    document: DocumentType,
     library: QuestionnaireProfileLibrary,
     profile: QuestionnaireProfile,
 ) -> list[tuple[str, str]]:
@@ -117,6 +147,11 @@ def _section_one_rows(
             if not contains_start:
                 continue
             started = True
+        elif contains_start:
+            # Some distributed questionnaires append a second, fully filled
+            # demonstration form after the client's form. A repeated section
+            # start marks a new form, not a continuation of the first one.
+            break
         elif row_labels and library.stops_section(row_labels[0], profile):
             break
         result.extend(_rows(table, library, profile))
@@ -171,28 +206,48 @@ def _extract_applicant(value: str, inn: str) -> tuple[str, str]:
         return "", ""
     text = value
     if inn:
-        text = text.replace(inn, "")
+        # Questionnaires often group a personal INN as ``6673 5285 5774``.
+        # Match separators horizontally so the expression cannot consume the
+        # postal index from the following line.
+        spaced_inn = r"[ \t-]*".join(re.escape(digit) for digit in inn)
+        text = re.sub(rf"(?<!\d){spaced_inn}(?!\d)", "", text)
     text = re.sub(r"\bИНН\s*[:№-]?", "", text, flags=re.IGNORECASE)
     lines = [_clean(line) for line in text.splitlines() if _clean(line)]
     address = ""
     name_parts = []
     for line in lines:
-        if re.search(r"\bадрес\b", line, re.IGNORECASE):
+        postal_index = re.search(r"(?<!\d)\d{6}\s*[,;]", line)
+        if postal_index:
+            possible_name = line[: postal_index.start()].strip(" ,;-")
+            if possible_name:
+                name_parts.append(possible_name)
+            address = line[postal_index.start() :]
+        elif re.search(r"\bадрес\b", line, re.IGNORECASE):
             address = re.sub(r"^.*?адрес\s*[:—-]?\s*", "", line, flags=re.IGNORECASE)
+        elif (
+            re.search(r"(?i)(?:^|[,;])\s*(?:Россия|РФ)\s*[,;]", line)
+            and re.search(r"(?i)\b(?:г\.|город|ул\.|улица|д\.)", line)
+        ):
+            address = line
         else:
             name_parts.append(line)
     name = _clean(" ".join(name_parts)).strip(" ,;-()")
     return name, address
 
 
-def _extract_program_name(document: Document) -> str:
-    """Read the standalone `ПО «…»` title used by extended questionnaires."""
+def _extract_program_name(document: DocumentType) -> str:
+    """Read a standalone quoted title used by extended questionnaires."""
 
-    pattern = re.compile(r"(?i)^ПО\s*[«\"]\s*(.+?)\s*[»\"]\s*$")
+    patterns = (
+        re.compile(r"(?is)^ПО\s*[«\"]\s*(.+?)\s*[»\"]\s*$"),
+        re.compile(r"(?is)^[«\"]\s*(.+?)\s*[»\"]\s*$"),
+    )
     for paragraph in document.paragraphs:
-        match = pattern.match(_clean(paragraph.text))
-        if match:
-            return _clean(match.group(1))
+        text = _clean(paragraph.text).replace("\n", " ")
+        for pattern in patterns:
+            match = pattern.match(text)
+            if match:
+                return _clean(match.group(1))
     return ""
 
 
@@ -224,9 +279,19 @@ def _extract_names(value: str) -> list[str]:
 
 
 def _normalize_numeric_dates(value: str) -> str:
+    def normalized_year(raw_year: str) -> int:
+        year = int(raw_year)
+        if len(raw_year) == 4:
+            return year
+        current_short_year = date.today().year % 100
+        return 2000 + year if year <= current_short_year else 1900 + year
+
     return re.sub(
-        r"(?<!\d)(\d{1,2})\.\s*(\d{1,2})\.\s*(\d{4})(?!\d)",
-        lambda match: f"{int(match.group(1)):02d}.{int(match.group(2)):02d}.{match.group(3)}",
+        r"(?<!\d)(\d{1,2})\.\s*(\d{1,2})\.\s*(\d{2}|\d{4})(?!\d)(?!\.\d)",
+        lambda match: (
+            f"{int(match.group(1)):02d}.{int(match.group(2)):02d}."
+            f"{normalized_year(match.group(3)):04d}"
+        ),
         value,
     )
 
@@ -244,7 +309,10 @@ def _looks_like_passport_value(value: str) -> bool:
     has_identity = bool(_extract_names(text)) and bool(DATE_RE.search(text) or TEXT_DATE_RE.search(text))
     has_passport = bool(
         re.search(r"(?i)\bпаспорт\b", text)
-        or re.search(r"(?<!\d)(?:\d{2}\s+\d{2}|\d{4})\s+\d{6}(?!\d)", text)
+        or re.search(
+            r"(?<!\d)(?:\d{2}[ \t]+\d{2}|\d{4})[ \t]+\d{6}(?!\d)",
+            text,
+        )
         or re.search(r"(?i)\b[А-ЯЁA-Z]{2}\s*№\s*\d{6,9}\b", text)
     )
     return has_identity and has_passport
@@ -311,13 +379,18 @@ def _clean_passport_issuer(value: str) -> str:
     """Remove questionnaire-only fields accidentally captured as the issuer."""
 
     value = re.sub(
+        r"(?i)^\s*(?:года\b|г\.(?=\s|$)|г(?=\s))\s*[,;:-]?\s*",
+        "",
+        value,
+    )
+    value = re.sub(
         r"(?i)^\s*(?:выдавший\s+орган|орган,?\s+выдавший\s+документ)\s*"
         r"[:—-]?\s*(?:орган\s+)?",
         "",
         value,
     )
     value = re.split(
-        r"(?i)\b(?:код\s+подразделения|дата\s+выдачи|"
+        r"(?i)\b(?:код\s+подразделения|к\.?\s*п\.?|дата\s+выдачи|"
         r"зарегистрирован\w*|проживающ\w*|место\s+жительства)\b\s*[:—-]?",
         value,
         maxsplit=1,
@@ -364,8 +437,8 @@ def _extract_passport(author: SoftwareAuthor, value: str) -> None:
         r"(?i)паспорт(?:\s+РФ)?\s*(\d{4})\s*(\d{6})",
         r"(?i)(?:серия|серии)\s*[:—-]?\s*[«\"]?(\d{2})\s*(\d{2})[»\"]?\s*[,;]?\s*(?:и\s+)?(?:номер|№|no\.?)\s*[«\"]?(\d{6})",
         r"(?i)паспорт\s+([А-ЯЁA-Z]{2})\s*№\s*(\d{6,9})",
-        r"(?<!\d)(\d{2})\s+(\d{2})\s+(\d{6})(?!\d)",
-        r"(?<!\d)(\d{4})\s+(\d{6})(?!\d)",
+        r"(?<!\d)(\d{2})[ \t]+(\d{2})[ \t]+(\d{6})(?!\d)",
+        r"(?<!\d)(\d{4})[ \t]+(\d{6})(?!\d)",
     )
     passport_end: int | None = None
     for pattern in passport_patterns:
@@ -473,7 +546,7 @@ def _extract_passport(author: SoftwareAuthor, value: str) -> None:
                 line_start = text.rfind("\n", 0, date_position) + 1
                 before_date = text[line_start:date_position]
                 passport_pair = re.search(
-                    r"(?<!\d)(?:\d{2}\s+\d{2}|\d{4})\s+\d{6}(?!\d)",
+                    r"(?<!\d)(?:\d{2}[ \t]+\d{2}|\d{4})[ \t]+\d{6}(?!\d)",
                     before_date,
                 )
                 if passport_pair:
@@ -534,7 +607,7 @@ def _extract_passport(author: SoftwareAuthor, value: str) -> None:
                 or YEAR_FIRST_TEXT_DATE_RE.fullmatch(cleaned_line)
             )
             passport_numbers = re.search(
-                r"(?<!\d)(?:\d{2}\s+\d{2}|\d{4})\s+\d{6}(?!\d)",
+                r"(?<!\d)(?:\d{2}[ \t]+\d{2}|\d{4})[ \t]+\d{6}(?!\d)",
                 cleaned_line,
             )
             if (
@@ -602,13 +675,34 @@ def _contribution_from_author_chunk(value: str) -> str:
     return _clean_contribution("\n".join(lines))
 
 
+def _named_contributions(value: str) -> dict[str, str]:
+    """Extract contributions keyed by FIO instead of relying on row order."""
+
+    header = re.compile(
+        r"(?im)^[ \t]*(?:\d+[.)][ \t]*)?"
+        r"([А-ЯЁ][А-ЯЁа-яё-]+(?:-[А-ЯЁ][А-ЯЁа-яё-]+)?[ \t]+"
+        r"[А-ЯЁ][А-ЯЁа-яё-]+(?:-[А-ЯЁ][А-ЯЁа-яё-]+)?[ \t]+"
+        r"[А-ЯЁ][А-ЯЁа-яё-]+(?:-[А-ЯЁ][А-ЯЁа-яё-]+)?)"
+        r"[ \t]*[-–—:][ \t]*"
+    )
+    matches = list(header.finditer(value))
+    result: dict[str, str] = {}
+    for index, match in enumerate(matches):
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(value)
+        contribution = _clean_contribution(value[match.end() : end])
+        if contribution:
+            result[_norm(match.group(1))] = contribution
+    return result
+
+
 def parse_questionnaire(
     path: str | Path,
     *,
     profile_library: QuestionnaireProfileLibrary | None = None,
 ) -> QuestionnaireParseResult:
     source = Path(path)
-    document = Document(source)
+    _validate_questionnaire_file(source)
+    document = Document(str(source))
     library = profile_library or default_profile_library()
     profile = library.select_profile(_document_labels(document))
     rows = _section_one_rows(document, library, profile)
@@ -631,6 +725,7 @@ def parse_questionnaire(
     by_number: defaultdict[int, dict[str, list[str]]] = defaultdict(lambda: defaultdict(list))
     sequential_passports: list[str] = []
     sequential_contributions: list[str] = []
+    contributions_by_name: dict[str, str] = {}
     sequential_bases: list[str] = []
     grouped_passport_count = 0
 
@@ -643,6 +738,10 @@ def parse_questionnaire(
         looks_passport = library.row_matches(profile, "passport", normalized)
         looks_contribution = library.row_matches(profile, "contribution", normalized)
         looks_basis = library.row_matches(profile, "rights_basis", normalized)
+        named_contributions = (
+            _named_contributions(value) if looks_contribution else {}
+        )
+        contributions_by_name.update(named_contributions)
 
         if looks_basis:
             chunks = _split_author_chunks(value)
@@ -677,6 +776,8 @@ def parse_questionnaire(
                     if contribution:
                         (by_number[number]["contribution"] if number else sequential_contributions).append(contribution)
             else:
+                if named_contributions:
+                    continue
                 chunks = _split_author_chunks(value)
                 if len(chunks) > 1:
                     if (
@@ -720,6 +821,11 @@ def parse_questionnaire(
         len(sequential_passports),
         len(sequential_contributions),
     )
+    if target_count > MAX_AUTHORS:
+        raise ValueError(
+            f"В анкете распознано неожиданно большое число авторов ({target_count}). "
+            "Проверьте поле с количеством авторов."
+        )
     while len(authors) < target_count:
         authors.append(SoftwareAuthor())
 
@@ -729,8 +835,15 @@ def parse_questionnaire(
         )
         if passport_values:
             _extract_passport(author, "\n".join(passport_values))
-        contribution_values = by_number[index]["contribution"] or (
-            [sequential_contributions[index - 1]] if index <= len(sequential_contributions) else []
+        named_contribution = contributions_by_name.get(_norm(author.full_name), "")
+        contribution_values = (
+            by_number[index]["contribution"]
+            or ([named_contribution] if named_contribution else [])
+            or (
+                [sequential_contributions[index - 1]]
+                if index <= len(sequential_contributions)
+                else []
+            )
         )
         if contribution_values:
             author.creative_contribution = _clean_contribution("\n".join(contribution_values))
@@ -760,6 +873,7 @@ def parse_questionnaire(
         applicant_name=applicant_name,
         applicant_address=applicant_address,
         inn=inn,
+        applicant_type=detect_applicant_type(applicant_name, inn),
         authors=authors,
         authors_will_be_mentioned=authors_will_be_mentioned,
         declared_author_count=declared_count,

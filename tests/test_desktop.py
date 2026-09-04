@@ -1,13 +1,20 @@
 import os
+import time
+from typing import Any, cast
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtWidgets import QApplication, QPushButton, QScrollArea
+from PySide6.QtCore import QStandardPaths
+from PySide6.QtWidgets import QApplication, QMessageBox, QPushButton, QScrollArea
 
-from app import MainWindow, RecordCard
+from app import BackgroundWidget, MainWindow, RecordCard
 from trademark_report.fips import NiceClass, TrademarkRecord
 from trademark_report.ogrn import FnsRegistrationData
-from trademark_report.software_models import SoftwareAuthor, SoftwareConsentData
+from trademark_report.software_models import (
+    APPLICANT_INDIVIDUAL,
+    SoftwareAuthor,
+    SoftwareConsentData,
+)
 
 
 def test_native_window_has_expected_tabs_and_no_web_server():
@@ -24,13 +31,15 @@ def test_native_window_has_expected_tabs_and_no_web_server():
         "Маша",
         "Лера",
     ]
-    assert window.centralWidget().objectName() == "appBackground"
+    central = window.centralWidget()
+    assert isinstance(central, BackgroundWidget)
+    assert central.objectName() == "appBackground"
     assert [window.navigation.item(index).text() for index in range(window.navigation.count())] == [
         "Отчёт по товарному знаку",
         "Программа для ЭВМ",
     ]
     assert window.pages.count() == 2
-    assert not window.centralWidget()._background.isNull()
+    assert not central._background.isNull()
     assert not hasattr(window, "conclusion_additions")
     assert not hasattr(window, "excess_items")
     assert window.conclusion_preview.toPlainText().strip()
@@ -124,6 +133,41 @@ def test_validation_does_not_require_passport_data_for_anonymous_authors():
     assert page.validation_errors() == []
     assert "☐ упоминать его под своим именем" in page.preview.toPlainText()
     assert "☒ не упоминать его (анонимно)" in page.preview.toPlainText()
+
+    window.close()
+    application.processEvents()
+
+
+def test_individual_applicant_does_not_require_or_preview_ogrn():
+    application = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    page = window.software_page
+    page.set_data(
+        SoftwareConsentData(
+            applicant_type=APPLICANT_INDIVIDUAL,
+            program_name="Заноза",
+            applicant_name="Анфиногенов Семен Васильевич",
+            applicant_address="Россия, г. Екатеринбург",
+            inn="667803703833",
+            authors_will_be_mentioned=False,
+            authors=[
+                SoftwareAuthor(
+                    full_name="Старков Алексей Николаевич",
+                    creative_contribution="Разработка всей программы",
+                )
+            ],
+        )
+    )
+    application.processEvents()
+
+    assert page.data().applicant_type == APPLICANT_INDIVIDUAL
+    assert page.data().missing_common_fields() == []
+    assert page.validation_errors() == []
+    assert page.ogrn_container.isHidden()
+    preview = page.preview.toPlainText()
+    assert "ИНН: 667803703833" in preview
+    assert "ОГРН:" not in preview
+    assert "125993" in preview
 
     window.close()
     application.processEvents()
@@ -258,4 +302,83 @@ def test_international_card_uses_wipo_and_applies_record():
     assert card.classes.text() == "03, 05, 16"
 
     card.close()
+    application.processEvents()
+
+
+def test_busy_record_card_cannot_be_removed_until_worker_finishes():
+    application = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    window.russian.add_card()
+    card = window.russian.cards[0]
+
+    class BusyThread:
+        def isRunning(self):
+            return True
+
+    cast(Any, card)._thread = BusyThread()
+    window.russian.remove_card(card)
+
+    assert window.russian.cards == [card]
+    card._thread = None
+    window.close()
+    application.processEvents()
+
+
+def test_incomplete_similar_record_is_rejected_before_report_generation():
+    application = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    window.russian.add_card()
+    card = window.russian.cards[0]
+    card.url.setText("https://new.fips.ru/registers-doc-view/fips_servlet?DB=RUTM")
+
+    validation_error = window.russian.validation_error()
+    assert validation_error is not None
+    assert "заполните" in validation_error
+
+    window.close()
+    application.processEvents()
+
+
+def test_consent_documents_are_saved_without_blocking_the_ui(monkeypatch, tmp_path):
+    application = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    page = window.software_page
+    page.set_data(
+        SoftwareConsentData(
+            program_name="Тестовая программа",
+            applicant_name="ООО «Тест»",
+            applicant_address="Россия, г. Москва",
+            inn="7707083893",
+            ogrn="1027700132195",
+            authors=[
+                SoftwareAuthor(
+                    full_name="Иванов Иван Иванович",
+                    birth_date="01.01.1980",
+                    address="Россия, г. Москва",
+                    passport_series="4510",
+                    passport_number="123456",
+                    passport_issue_date="02.02.2020",
+                    passport_issuer="ГУ МВД России по г. Москве",
+                    creative_contribution="Разработка алгоритма",
+                )
+            ],
+        )
+    )
+    monkeypatch.setattr(QStandardPaths, "writableLocation", lambda *_: str(tmp_path))
+    monkeypatch.setattr(QMessageBox, "information", lambda *args, **kwargs: None)
+    monkeypatch.setattr(QMessageBox, "critical", lambda *args, **kwargs: None)
+
+    page.save_document()
+
+    assert not page.save_button.isEnabled()
+    deadline = time.monotonic() + 10
+    while page._save_thread is not None and time.monotonic() < deadline:
+        application.processEvents()
+        time.sleep(0.01)
+    application.processEvents()
+    assert page._save_thread is None
+    assert page.save_button.isEnabled()
+    assert (tmp_path / "Согласие Иванов Иван Иванович.docx").is_file()
+
+    window.close()
     application.processEvents()

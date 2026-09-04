@@ -2,12 +2,21 @@
 
 from __future__ import annotations
 
+import re
 from datetime import date
 from html import escape
 from pathlib import Path
-import re
 
-from PySide6.QtCore import QDate, QObject, QStandardPaths, QThread, Qt, Signal, Slot
+from PySide6.QtCore import (
+    QDate,
+    QObject,
+    QStandardPaths,
+    Qt,
+    QThread,
+    QTimer,
+    Signal,
+    Slot,
+)
 from PySide6.QtWidgets import (
     QComboBox,
     QDateEdit,
@@ -34,9 +43,20 @@ from .ogrn import (
     OgrnLookupError,
     fetch_registration_data,
     prefer_full_registration_name,
+    validate_inn,
 )
 from .questionnaire import parse_questionnaire
-from .software_models import SoftwareAuthor, SoftwareConsentData
+from .software_models import (
+    APPLICANT_INDIVIDUAL,
+    APPLICANT_LEGAL_ENTITY,
+    APPLICANT_SOLE_PROPRIETOR,
+    APPLICANT_TYPE_LABELS,
+    SoftwareAuthor,
+    SoftwareConsentData,
+    detect_applicant_type,
+    is_valid_date_text,
+    is_valid_ogrn,
+)
 
 
 def _scrollable(widget: QWidget) -> QScrollArea:
@@ -63,6 +83,26 @@ class OgrnWorker(QObject):
             self.failed.emit(str(exc))
         except Exception as exc:  # pragma: no cover - defensive GUI boundary
             self.failed.emit(f"Непредвиденная ошибка при обращении к ФНС: {exc}")
+
+
+class ConsentSaveWorker(QObject):
+    finished = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, data: SoftwareConsentData, directory: Path, template_path: Path):
+        super().__init__()
+        self.data = data
+        self.directory = directory
+        self.template_path = template_path
+
+    @Slot()
+    def run(self) -> None:
+        try:
+            self.finished.emit(
+                save_author_consents(self.data, self.directory, self.template_path)
+            )
+        except Exception as exc:  # pragma: no cover - defensive worker boundary
+            self.failed.emit(str(exc))
 
 
 class AuthorEditor(QWidget):
@@ -150,6 +190,9 @@ class SoftwareConsentWidget(QWidget):
         self._ogrn_thread: QThread | None = None
         self._ogrn_worker: OgrnWorker | None = None
         self._ogrn_lookup_inn = ""
+        self._pending_ogrn_lookup: tuple[str, bool] | None = None
+        self._save_thread: QThread | None = None
+        self._save_worker: ConsentSaveWorker | None = None
         self._warnings: list[str] = []
         self._authors_will_be_mentioned: bool | None = None
         self._questionnaire_profile_id = ""
@@ -194,11 +237,16 @@ class SoftwareConsentWidget(QWidget):
         common_form = QFormLayout(common_box)
         common_form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows)
         self.program_name = QLineEdit()
+        self.applicant_type = QComboBox()
+        for applicant_type, label in APPLICANT_TYPE_LABELS.items():
+            self.applicant_type.addItem(label, applicant_type)
         self.applicant_name = QLineEdit()
         self.applicant_address = QTextEdit()
         self.applicant_address.setMaximumHeight(72)
         self.inn = QLineEdit()
-        ogrn_row = QHBoxLayout()
+        self.ogrn_container = QWidget()
+        ogrn_row = QHBoxLayout(self.ogrn_container)
+        ogrn_row.setContentsMargins(0, 0, 0, 0)
         self.ogrn = QLineEdit()
         self.ogrn_button = QPushButton("Получить по ИНН")
         self.ogrn_button.clicked.connect(self.lookup_ogrn)
@@ -208,10 +256,12 @@ class SoftwareConsentWidget(QWidget):
         self.document_date.setCalendarPopup(True)
         self.document_date.setDisplayFormat("dd.MM.yyyy")
         common_form.addRow("Название программы *:", self.program_name)
+        common_form.addRow("Тип заявителя *:", self.applicant_type)
         common_form.addRow("Заявитель *:", self.applicant_name)
         common_form.addRow("Адрес заявителя *:", self.applicant_address)
         common_form.addRow("ИНН *:", self.inn)
-        common_form.addRow("ОГРН/ОГРНИП *:", ogrn_row)
+        self.ogrn_label = QLabel("ОГРН *:")
+        common_form.addRow(self.ogrn_label, self.ogrn_container)
         common_form.addRow("Дата:", self.document_date)
         form_layout.addWidget(common_box)
 
@@ -268,6 +318,8 @@ class SoftwareConsentWidget(QWidget):
 
         for widget in (self.program_name, self.inn, self.ogrn):
             widget.textChanged.connect(self._refresh_preview)
+        self.applicant_type.currentIndexChanged.connect(self._applicant_type_changed)
+        self.inn.editingFinished.connect(self._detect_applicant_type_from_fields)
         self.applicant_name.textChanged.connect(self._applicant_name_changed)
         self.applicant_address.textChanged.connect(self._applicant_address_changed)
         self.document_date.dateChanged.connect(self._refresh_preview)
@@ -303,13 +355,22 @@ class SoftwareConsentWidget(QWidget):
             f"Анкета загружена: {Path(path).name}; "
             f"профиль: {result.data.questionnaire_profile_name}"
         )
-        if result.data.inn:
+        if result.data.inn and result.data.applicant_type != APPLICANT_INDIVIDUAL:
             self.lookup_ogrn(silent=True)
 
     def set_data(self, data: SoftwareConsentData) -> None:
+        self._pending_ogrn_lookup = None
         self._authors_will_be_mentioned = data.authors_will_be_mentioned
         self._questionnaire_profile_id = data.questionnaire_profile_id
         self._questionnaire_profile_name = data.questionnaire_profile_name
+        applicant_type = data.applicant_type
+        if (
+            applicant_type == APPLICANT_LEGAL_ENTITY
+            and len(re.sub(r"\D", "", data.inn)) == 12
+            and not data.ogrn
+        ):
+            applicant_type = detect_applicant_type(data.applicant_name, data.inn, data.ogrn)
+        self._set_applicant_type(applicant_type)
         self.program_name.setText(data.program_name)
         self._set_applicant_name(data.applicant_name)
         self.applicant_address.setPlainText(data.applicant_address)
@@ -322,10 +383,42 @@ class SoftwareConsentWidget(QWidget):
         while self.author_tabs.count():
             page = self.author_tabs.widget(0)
             self.author_tabs.removeTab(0)
-            page.deleteLater()
+            if page is not None:
+                page.deleteLater()
         for author in data.authors or [SoftwareAuthor()]:
             self.add_author(author)
         self._refresh_preview()
+
+    def _current_applicant_type(self) -> str:
+        value = self.applicant_type.currentData()
+        return value if value in APPLICANT_TYPE_LABELS else APPLICANT_LEGAL_ENTITY
+
+    def _set_applicant_type(self, applicant_type: str) -> None:
+        index = self.applicant_type.findData(applicant_type)
+        self.applicant_type.setCurrentIndex(max(0, index))
+        self._update_applicant_type_ui()
+
+    @Slot()
+    def _detect_applicant_type_from_fields(self) -> None:
+        self._set_applicant_type(
+            detect_applicant_type(
+                self.applicant_name.text(), self.inn.text(), self.ogrn.text()
+            )
+        )
+
+    @Slot()
+    def _applicant_type_changed(self) -> None:
+        self._update_applicant_type_ui()
+        self._refresh_preview()
+
+    def _update_applicant_type_ui(self) -> None:
+        applicant_type = self._current_applicant_type()
+        registration_required = applicant_type != APPLICANT_INDIVIDUAL
+        self.ogrn_label.setVisible(registration_required)
+        self.ogrn_container.setVisible(registration_required)
+        self.ogrn_label.setText(
+            "ОГРНИП *:" if applicant_type == APPLICANT_SOLE_PROPRIETOR else "ОГРН *:"
+        )
 
     def add_author(self, author: SoftwareAuthor) -> None:
         editor = AuthorEditor(author)
@@ -344,7 +437,8 @@ class SoftwareConsentWidget(QWidget):
         page = self.author_tabs.widget(index)
         editor = self.author_editors.pop(index)
         self.author_tabs.removeTab(index)
-        page.deleteLater()
+        if page is not None:
+            page.deleteLater()
         editor.deleteLater()
         self._refresh_author_titles()
         self._refresh_preview()
@@ -355,6 +449,8 @@ class SoftwareConsentWidget(QWidget):
         if index < 0 or target < 0 or target >= len(self.author_editors):
             return
         page = self.author_tabs.widget(index)
+        if page is None:
+            return
         editor = self.author_editors.pop(index)
         self.author_tabs.removeTab(index)
         self.author_editors.insert(target, editor)
@@ -364,7 +460,7 @@ class SoftwareConsentWidget(QWidget):
         self._refresh_preview()
 
     def _refresh_author_titles(self) -> None:
-        for index, editor in enumerate(self.author_editors):
+        for index, _editor in enumerate(self.author_editors):
             self.author_tabs.setTabText(index, f"Автор {index + 1}")
         self.author_count_label.setText(f"Количество: {len(self.author_editors)}")
 
@@ -415,12 +511,23 @@ class SoftwareConsentWidget(QWidget):
 
     @Slot()
     def lookup_ogrn(self, *, silent: bool = False) -> None:
+        if self._current_applicant_type() == APPLICANT_INDIVIDUAL:
+            self.status_message.emit(
+                "Для физического лица ОГРН не требуется; адрес заявителя заполните вручную."
+            )
+            return
         inn = self.inn.text().strip()
         if not inn:
             if not silent:
                 QMessageBox.warning(self, "Нет ИНН", "Введите или загрузите ИНН заявителя.")
             return
         if self._ogrn_thread and self._ogrn_thread.isRunning():
+            normalized = re.sub(r"\D", "", inn)
+            if normalized != self._ogrn_lookup_inn:
+                self._pending_ogrn_lookup = (inn, silent)
+                self.status_message.emit(
+                    "ИНН изменился: новый запрос к ФНС будет выполнен сразу после текущего."
+                )
             return
         self.ogrn_button.setEnabled(False)
         self.ogrn_button.setText("Поиск…")
@@ -443,17 +550,27 @@ class SoftwareConsentWidget(QWidget):
     def _ogrn_finished(self) -> None:
         self._ogrn_worker = None
         self._ogrn_thread = None
+        pending = self._pending_ogrn_lookup
+        self._pending_ogrn_lookup = None
+        if pending and re.sub(r"\D", "", self.inn.text()) == re.sub(r"\D", "", pending[0]):
+            QTimer.singleShot(0, lambda: self.lookup_ogrn(silent=pending[1]))
 
     def stop_workers(self) -> None:
         """Finish the network worker before the application destroys Qt objects."""
-        if self._ogrn_thread and self._ogrn_thread.isRunning():
-            self._ogrn_thread.quit()
-            self._ogrn_thread.wait(22000)
+        self._pending_ogrn_lookup = None
+        for thread in (self._ogrn_thread, self._save_thread):
+            if thread and thread.isRunning():
+                thread.requestInterruption()
+                thread.quit()
+                thread.wait()
 
     @Slot(object)
     def _ogrn_received(self, result: FnsRegistrationData) -> None:
         if re.sub(r"\D", "", self.inn.text()) == self._ogrn_lookup_inn:
             self.ogrn.setText(result.ogrn)
+            self._set_applicant_type(
+                detect_applicant_type(self.applicant_name.text(), self.inn.text(), result.ogrn)
+            )
             received = ["ОГРН"]
             if result.name:
                 name = prefer_full_registration_name(
@@ -495,6 +612,7 @@ class SoftwareConsentWidget(QWidget):
             applicant_address=self.applicant_address.toPlainText().strip(),
             inn=re.sub(r"\D", "", self.inn.text()),
             ogrn=re.sub(r"\D", "", self.ogrn.text()),
+            applicant_type=self._current_applicant_type(),
             application_number="",
             document_date=date(qdate.year(), qdate.month(), qdate.day()),
             authors=[editor.value() for editor in self.author_editors],
@@ -507,16 +625,32 @@ class SoftwareConsentWidget(QWidget):
     def validation_errors(self) -> list[str]:
         data = self.data()
         errors = [f"Не заполнено: {field}." for field in data.missing_common_fields()]
-        if data.inn and len(data.inn) not in (10, 12):
-            errors.append("ИНН должен содержать 10 или 12 цифр.")
-        if data.ogrn and len(data.ogrn) not in (13, 15):
-            errors.append("ОГРН должен содержать 13 цифр, ОГРНИП — 15 цифр.")
+        if data.inn:
+            try:
+                validate_inn(data.inn)
+            except OgrnLookupError as exc:
+                errors.append(str(exc))
+        if (
+            data.applicant_type != APPLICANT_INDIVIDUAL
+            and data.ogrn
+            and not is_valid_ogrn(data.ogrn)
+        ):
+            errors.append("ОГРН/ОГРНИП имеет неверную длину или контрольную цифру.")
         for index, author in enumerate(data.authors, 1):
             missing = author.missing_fields(
                 require_personal_data=data.authors_will_be_mentioned is not False
             )
             if missing:
                 errors.append(f"Автор {index}: не заполнены {', '.join(missing)}.")
+            if data.authors_will_be_mentioned is not False:
+                for label, value in (
+                    ("дата рождения", author.birth_date),
+                    ("дата выдачи паспорта", author.passport_issue_date),
+                ):
+                    if value and not is_valid_date_text(value):
+                        errors.append(
+                            f"Автор {index}: {label} должна быть реальной датой в формате ДД.ММ.ГГГГ."
+                        )
         return errors
 
     @Slot()
@@ -545,6 +679,15 @@ class SoftwareConsentWidget(QWidget):
             f"{passport_value(author.passport_issue_date)} {passport_value(issuer)}"
         )
         current_date = data.document_date.strftime("%d.%m.%Y")
+        registration_line = (
+            f"ИНН: {value(data.inn)}"
+            if data.applicant_type == APPLICANT_INDIVIDUAL
+            else (
+                f"ОГРНИП: {value(data.ogrn)} &nbsp;&nbsp; ИНН: {value(data.inn)}"
+                if data.applicant_type == APPLICANT_SOLE_PROPRIETOR
+                else f"ОГРН: {value(data.ogrn)} &nbsp;&nbsp; ИНН: {value(data.inn)}"
+            )
+        )
         author_mention_choice = (
             "☐ упоминать его под своим именем &nbsp;&nbsp; ☒ не упоминать его (анонимно)"
             if data.authors_will_be_mentioned is False
@@ -562,7 +705,7 @@ class SoftwareConsentWidget(QWidget):
         </style>
         <div class="page">
           <div class="right">В Федеральную службу<br>по интеллектуальной собственности<br>
-          Бережковская наб., д. 30, корп. 1,<br>г. Москва, Г-59, ГСП-1, 119991,<br>Российская Федерация</div>
+          Бережковская наб., д. 30, корп. 1,<br>г. Москва, Г-59, ГСП-1, 125993,<br>Российская Федерация</div>
           <p>Название программы для ЭВМ или базы данных<br>«{value(data.program_name)}»</p>
           <h3>Согласие на обработку персональных данных</h3>
           <p><span class="label">Ф. И. О. субъекта персональных данных</span> {value(author.full_name)}</p>
@@ -576,7 +719,7 @@ class SoftwareConsentWidget(QWidget):
           <h3>Согласие автора на указание сведений об авторе, указанных в заявлении</h3>
           <p>Название: «{value(data.program_name)}»</p>
           <p><span class="label">Правообладатель (Заявитель):</span><br>{value(data.applicant_name)}<br>
-          {value(data.applicant_address)}<br>ОГРН: {value(data.ogrn)} &nbsp;&nbsp; ИНН: {value(data.inn)}</p>
+          {value(data.applicant_address)}<br>{registration_line}</p>
           <p><span class="label">Фамилия имя отчество:</span> {value(author.full_name)}<br>
           <span class="label">Дата рождения:</span> {value(author.birth_date)} &nbsp;
           <span class="label">Гражданство:</span> {value(author.citizenship)}</p>
@@ -604,11 +747,27 @@ class SoftwareConsentWidget(QWidget):
             QStandardPaths.StandardLocation.DesktopLocation
         )
         desktop = Path(desktop_value) if desktop_value else Path.home() / "Desktop"
-        try:
-            paths = save_author_consents(data, desktop, self.template_path)
-        except Exception as exc:  # pragma: no cover - defensive GUI boundary
-            QMessageBox.critical(self, "Не удалось сформировать согласия", str(exc))
+        if self._save_thread and self._save_thread.isRunning():
             return
+        self.save_button.setEnabled(False)
+        self.save_button.setText("Формирование…")
+        self.status_message.emit("Формирую согласия…")
+        self._save_thread = QThread(self)
+        self._save_worker = ConsentSaveWorker(data, desktop, self.template_path)
+        self._save_worker.moveToThread(self._save_thread)
+        self._save_thread.started.connect(self._save_worker.run)
+        self._save_worker.finished.connect(
+            lambda paths: self._documents_saved(paths, desktop)
+        )
+        self._save_worker.failed.connect(self._documents_save_failed)
+        self._save_worker.finished.connect(self._save_thread.quit)
+        self._save_worker.failed.connect(self._save_thread.quit)
+        self._save_thread.finished.connect(self._save_worker.deleteLater)
+        self._save_thread.finished.connect(self._save_thread.deleteLater)
+        self._save_thread.finished.connect(self._save_thread_finished)
+        self._save_thread.start()
+
+    def _documents_saved(self, paths: list[Path], desktop: Path) -> None:
         self.status_message.emit(
             f"Создано согласий: {len(paths)}. Папка: {desktop}"
         )
@@ -617,3 +776,14 @@ class SoftwareConsentWidget(QWidget):
             "Готово",
             f"На рабочем столе создано документов: {len(paths)}.\n\nПапка:\n{desktop}",
         )
+
+    @Slot(str)
+    def _documents_save_failed(self, message: str) -> None:
+        QMessageBox.critical(self, "Не удалось сформировать согласия", message)
+
+    @Slot()
+    def _save_thread_finished(self) -> None:
+        self._save_worker = None
+        self._save_thread = None
+        self.save_button.setEnabled(True)
+        self.save_button.setText("Сформировать согласия на рабочий стол")

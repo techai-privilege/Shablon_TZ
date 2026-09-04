@@ -1,6 +1,6 @@
+import re
 from datetime import date
 from io import BytesIO
-import re
 from zipfile import ZipFile
 
 from docx import Document
@@ -62,6 +62,7 @@ def test_generate_report_contains_expected_content_and_no_comments():
     with ZipFile(BytesIO(generated)) as archive:
         names = set(archive.namelist())
         assert "word/comments.xml" not in names
+        assert not any("comments" in name.casefold() for name in names)
         relationships = archive.read("word/_rels/document.xml.rels").decode("utf-8")
         assert "DocNumber=1227836" in relationships
 

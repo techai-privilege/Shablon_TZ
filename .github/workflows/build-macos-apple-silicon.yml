@@ -6,7 +6,6 @@ on:
       release_tag:
         description: Existing GitHub Release tag
         required: true
-        default: v0.1.5
 
 permissions:
   contents: write
@@ -32,6 +31,9 @@ jobs:
 
       - name: Install dependencies
         run: python -m pip install -e '.[build,dev]'
+
+      - name: Run static checks
+        run: python -m ruff check . --exclude build,dist,tmp
 
       - name: Run tests
         env:
@@ -63,11 +65,24 @@ jobs:
           cd dist
           shasum -a 256 "$archive" > "$archive.sha256"
 
+      - name: Refuse to overwrite release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          archive="Trademark-Report-${RELEASE_TAG}-macOS-Apple-Silicon.zip"
+          gh release view "$RELEASE_TAG" >/dev/null
+          assets="$(gh release view "$RELEASE_TAG" --json assets --jq '.assets[].name')"
+          for candidate in "$archive" "$archive.sha256"; do
+            if grep -Fxq "$candidate" <<< "$assets"; then
+              echo "Release asset already exists: $candidate" >&2
+              exit 1
+            fi
+          done
+
       - name: Attach files to release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release upload "$RELEASE_TAG" \
             "dist/Trademark-Report-${RELEASE_TAG}-macOS-Apple-Silicon.zip" \
-            "dist/Trademark-Report-${RELEASE_TAG}-macOS-Apple-Silicon.zip.sha256" \
-            --clobber
+            "dist/Trademark-Report-${RELEASE_TAG}-macOS-Apple-Silicon.zip.sha256"

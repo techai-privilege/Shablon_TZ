@@ -3,13 +3,18 @@
 from __future__ import annotations
 
 import re
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, urljoin, urlparse
 
-from bs4 import BeautifulSoup
 import requests
+from bs4 import BeautifulSoup
 
 from trademark_report.fips import NiceClass, TrademarkRecord
-
+from trademark_report.network import (
+    MAX_PAGE_BYTES,
+    GetSession,
+    checked_image_content,
+    limited_response_content,
+)
 
 ALLOWED_WIPO_HOSTS = {"www3.wipo.int"}
 DEFAULT_TIMEOUT_SECONDS = 25
@@ -30,7 +35,13 @@ def _clean(value: str | None) -> str | None:
 def _validate_wipo_url(url: str) -> str:
     parsed = urlparse(url.strip())
     host = (parsed.hostname or "").lower()
-    if parsed.scheme != "https" or host not in ALLOWED_WIPO_HOSTS:
+    if (
+        parsed.scheme != "https"
+        or host not in ALLOWED_WIPO_HOSTS
+        or parsed.port not in (None, 443)
+        or parsed.username
+        or parsed.password
+    ):
         raise WipoParseError(
             "Нужна HTTPS-ссылка на запись WIPO Madrid Monitor (www3.wipo.int)."
         )
@@ -43,7 +54,12 @@ def _validate_wipo_url(url: str) -> str:
 
 
 def _nice_classes(value: str | None) -> list[NiceClass]:
-    return [NiceClass(number.zfill(2)) for number in re.findall(r"\b\d{1,2}\b", value or "")]
+    numbers = {
+        int(number)
+        for number in re.findall(r"\b\d{1,2}\b", value or "")
+        if 1 <= int(number) <= 45
+    }
+    return [NiceClass(str(number).zfill(2)) for number in sorted(numbers)]
 
 
 def parse_wipo_html(html: bytes | str, source_url: str) -> TrademarkRecord:
@@ -73,9 +89,15 @@ def parse_wipo_html(html: bytes | str, source_url: str) -> TrademarkRecord:
     mark_name = _clean(header_match.group(2)) if header_match else None
 
     image = row.select_one("td.mark img")
-    image_url = image.get("src") if image else None
+    image_source = image.get("src") if image else None
+    image_url = (
+        urljoin(source_url, image_source)
+        if isinstance(image_source, str) and image_source
+        else None
+    )
     if not mark_name and image:
-        mark_name = _clean(image.get("alt"))
+        image_alt = image.get("alt")
+        mark_name = _clean(image_alt) if isinstance(image_alt, str) else None
 
     date_nodes = row.select("td.date")
     registration_date = _clean(date_nodes[0].get_text(" ", strip=True)) if date_nodes else None
@@ -103,40 +125,47 @@ def fetch_wipo_trademark(
     url: str,
     *,
     include_image: bool = True,
-    session: requests.Session | None = None,
+    session: GetSession | None = None,
     timeout: int = DEFAULT_TIMEOUT_SECONDS,
 ) -> TrademarkRecord:
     """Download one user-selected Madrid Monitor record and its mark image."""
 
     url = _validate_wipo_url(url)
+    owns_client = session is None
     client = session or requests.Session()
     headers = {"User-Agent": USER_AGENT, "Accept-Language": "en-US,en;q=0.9"}
     try:
-        response = client.get(url, headers=headers, timeout=timeout)
-        response.raise_for_status()
-    except requests.RequestException as exc:
-        raise WipoParseError(f"Не удалось загрузить карточку WIPO: {exc}") from exc
-
-    record = parse_wipo_html(response.content, response.url)
-    if include_image and record.image_url:
-        image_url = record.image_url
-        parsed_image = urlparse(image_url)
-        if (
-            parsed_image.scheme != "https"
-            or (parsed_image.hostname or "").lower() not in ALLOWED_WIPO_HOSTS
-            or not parsed_image.path.endswith("/madrid/monitor/jsp/data.jsp")
-        ):
-            raise WipoParseError("Карточка WIPO содержит неподдерживаемую ссылку на изображение.")
         try:
-            image_response = client.get(image_url, headers=headers, timeout=timeout)
-            image_response.raise_for_status()
-        except requests.RequestException as exc:
-            raise WipoParseError(
-                f"Данные WIPO получены, но изображение не загрузилось: {exc}"
-            ) from exc
-        content_type = image_response.headers.get("Content-Type", "")
-        if not content_type.lower().startswith("image/"):
-            raise WipoParseError("WIPO вернул вместо изображения неподдерживаемый файл.")
-        record.image_bytes = image_response.content
-        record.image_content_type = content_type
-    return record
+            response = client.get(url, headers=headers, timeout=timeout)
+            response.raise_for_status()
+            page = limited_response_content(response, MAX_PAGE_BYTES, "Страница WIPO")
+        except (requests.RequestException, ValueError) as exc:
+            raise WipoParseError(f"Не удалось загрузить карточку WIPO: {exc}") from exc
+
+        record = parse_wipo_html(page, response.url)
+        if include_image and record.image_url:
+            image_url = record.image_url
+            parsed_image = urlparse(image_url)
+            if (
+                parsed_image.scheme != "https"
+                or (parsed_image.hostname or "").lower() not in ALLOWED_WIPO_HOSTS
+                or parsed_image.port not in (None, 443)
+                or parsed_image.username
+                or parsed_image.password
+                or not parsed_image.path.endswith("/madrid/monitor/jsp/data.jsp")
+            ):
+                raise WipoParseError("Карточка WIPO содержит неподдерживаемую ссылку на изображение.")
+            try:
+                image_response = client.get(image_url, headers=headers, timeout=timeout)
+                image_response.raise_for_status()
+                image_bytes, content_type = checked_image_content(image_response, "WIPO")
+            except (requests.RequestException, ValueError) as exc:
+                raise WipoParseError(
+                    f"Данные WIPO получены, но изображение не загрузилось: {exc}"
+                ) from exc
+            record.image_bytes = image_bytes
+            record.image_content_type = content_type
+        return record
+    finally:
+        if owns_client and isinstance(client, requests.Session):
+            client.close()

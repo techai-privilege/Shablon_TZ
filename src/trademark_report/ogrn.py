@@ -2,16 +2,18 @@
 
 from __future__ import annotations
 
+import re
+import time
 from dataclasses import dataclass
 from html import unescape
 from io import BytesIO
-import re
-import time
+from threading import Lock
 
+import requests
 from pypdf import PdfReader
 from pypdf.errors import PdfReadError
-import requests
 
+from .network import MAX_PAGE_BYTES, MAX_PDF_BYTES, limited_response_content
 
 FNS_SEARCH_URL = "https://egrul.nalog.ru/"
 
@@ -29,10 +31,40 @@ class FnsRegistrationData:
 
 
 _ADDRESS_CACHE: dict[str, str] = {}
+_REGISTRATION_CACHE: dict[str, tuple[float, FnsRegistrationData]] = {}
+_CACHE_LOCK = Lock()
+_CACHE_TTL_SECONDS = 15 * 60
+
+
+def _cached_registration(inn: str) -> FnsRegistrationData | None:
+    with _CACHE_LOCK:
+        cached = _REGISTRATION_CACHE.get(inn)
+        if cached is None:
+            return None
+        created_at, result = cached
+        if time.monotonic() - created_at > _CACHE_TTL_SECONDS:
+            _REGISTRATION_CACHE.pop(inn, None)
+            return None
+        return result
+
+
+def _cache_registration(inn: str, result: FnsRegistrationData) -> None:
+    with _CACHE_LOCK:
+        _REGISTRATION_CACHE[inn] = (time.monotonic(), result)
 
 
 def normalize_inn(value: str) -> str:
     return re.sub(r"\D", "", value)
+
+
+def _json_object(response, description: str) -> dict:
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        raise ValueError(f"{description} содержит некорректный JSON.") from exc
+    if not isinstance(payload, dict):
+        raise ValueError(f"{description} имеет неожиданный формат.")
+    return payload
 
 
 def _registration_name(value: object) -> str:
@@ -71,12 +103,19 @@ def _valid_checksum(digits: str) -> bool:
     numbers = [int(item) for item in digits]
     if len(numbers) == 10:
         weights = (2, 4, 10, 3, 5, 9, 4, 6, 8)
-        return sum(a * b for a, b in zip(numbers[:9], weights)) % 11 % 10 == numbers[9]
+        return (
+            sum(a * b for a, b in zip(numbers[:9], weights, strict=True)) % 11 % 10
+            == numbers[9]
+        )
     if len(numbers) == 12:
         weights_11 = (7, 2, 4, 10, 3, 5, 9, 4, 6, 8)
         weights_12 = (3, 7, 2, 4, 10, 3, 5, 9, 4, 6, 8)
-        check_11 = sum(a * b for a, b in zip(numbers[:10], weights_11)) % 11 % 10
-        check_12 = sum(a * b for a, b in zip(numbers[:11], weights_12)) % 11 % 10
+        check_11 = (
+            sum(a * b for a, b in zip(numbers[:10], weights_11, strict=True)) % 11 % 10
+        )
+        check_12 = (
+            sum(a * b for a, b in zip(numbers[:11], weights_12, strict=True)) % 11 % 10
+        )
         return check_11 == numbers[10] and check_12 == numbers[11]
     return False
 
@@ -103,9 +142,9 @@ def extract_registered_address(text: str) -> str:
         ((index, found) for index, line in enumerate(lines) if (found := heading.match(line))),
         None,
     )
-    start = match[0] + 1 if match else None
-    if start is None:
+    if match is None:
         return ""
+    start = match[0] + 1
 
     parts: list[str] = []
     inline_value = (match[1].group(1) or "").strip(" ,")
@@ -221,7 +260,7 @@ def _fetch_statement_details(
                 timeout=_remaining_timeout(attempt_deadline),
             )
             requested.raise_for_status()
-            if requested.json().get("captchaRequired"):
+            if _json_object(requested, "Ответ ФНС на запрос выписки").get("captchaRequired"):
                 return "", "", "ФНС запросила CAPTCHA"
 
             while time.monotonic() < attempt_deadline:
@@ -231,7 +270,7 @@ def _fetch_statement_details(
                     timeout=_remaining_timeout(attempt_deadline),
                 )
                 status.raise_for_status()
-                state = status.json().get("status")
+                state = _json_object(status, "Статус выписки ФНС").get("status")
                 if state == "ready":
                     break
                 if state == "error":
@@ -249,7 +288,10 @@ def _fetch_statement_details(
                     timeout=_remaining_timeout(attempt_deadline),
                 )
                 downloaded.raise_for_status()
-                statement_text = _pdf_text(downloaded.content)
+                statement = limited_response_content(
+                    downloaded, MAX_PDF_BYTES, "PDF-выписка ФНС"
+                )
+                statement_text = _pdf_text(statement)
                 address = extract_registered_address(statement_text)
                 full_name = extract_full_registration_name(statement_text)
                 if address:
@@ -261,7 +303,9 @@ def _fetch_statement_details(
             last_error = "ФНС не ответила вовремя"
         except requests.RequestException as exc:
             last_error = f"ошибка связи с ФНС: {exc}"
-        except (ValueError, OSError, PdfReadError):
+        except ValueError as exc:
+            last_error = str(exc) or "ФНС вернула некорректные данные"
+        except (OSError, PdfReadError):
             last_error = "не удалось прочитать PDF-выписку ФНС"
 
         if attempt + 1 < attempts and time.monotonic() < overall_deadline:
@@ -275,54 +319,73 @@ def fetch_registration_data(
     """Return name, OGRN/OGRNIP and, when public, the registered address from FNS."""
 
     inn = validate_inn(inn_value)
+    if session is None and (cached := _cached_registration(inn)) is not None:
+        return cached
+
+    owns_client = session is None
     client = session or requests.Session()
     headers = {"User-Agent": "Mozilla/5.0 TrademarkConsentDesktop/1.0"}
     try:
-        response = client.post(
-            FNS_SEARCH_URL,
-            data={"query": inn, "region": "", "PreventChromeAutocomplete": ""},
-            headers=headers,
-            timeout=timeout,
-        )
-        response.raise_for_status()
-        payload = response.json()
-        if payload.get("captchaRequired"):
-            raise OgrnLookupError("ФНС запросила проверочный код. Введите данные вручную.")
-        token = payload.get("t")
-        if not token:
-            raise OgrnLookupError("ФНС не вернула идентификатор поиска.")
-        result = client.get(
-            f"{FNS_SEARCH_URL}search-result/{token}", headers=headers, timeout=timeout
-        )
-        result.raise_for_status()
-        rows = result.json().get("rows") or []
-    except OgrnLookupError:
-        raise
-    except (requests.RequestException, ValueError) as exc:
-        raise OgrnLookupError(f"Не удалось получить данные из ФНС: {exc}") from exc
+        try:
+            response = client.post(
+                FNS_SEARCH_URL,
+                data={"query": inn, "region": "", "PreventChromeAutocomplete": ""},
+                headers=headers,
+                timeout=timeout,
+            )
+            response.raise_for_status()
+            limited_response_content(response, MAX_PAGE_BYTES, "Ответ поиска ФНС")
+            payload = _json_object(response, "Ответ поиска ФНС")
+            if payload.get("captchaRequired"):
+                raise OgrnLookupError("ФНС запросила проверочный код. Введите данные вручную.")
+            token = payload.get("t")
+            if not token:
+                raise OgrnLookupError("ФНС не вернула идентификатор поиска.")
+            search_response = client.get(
+                f"{FNS_SEARCH_URL}search-result/{token}", headers=headers, timeout=timeout
+            )
+            search_response.raise_for_status()
+            limited_response_content(
+                search_response, MAX_PAGE_BYTES, "Результат поиска ФНС"
+            )
+            rows = _json_object(search_response, "Результат поиска ФНС").get("rows") or []
+            if not isinstance(rows, list) or not all(isinstance(row, dict) for row in rows):
+                raise ValueError("Результат поиска ФНС имеет неожиданный формат.")
+        except OgrnLookupError:
+            raise
+        except (requests.RequestException, ValueError) as exc:
+            raise OgrnLookupError(f"Не удалось получить данные из ФНС: {exc}") from exc
 
-    exact = [row for row in rows if normalize_inn(str(row.get("i", ""))) == inn]
-    if not exact:
-        raise OgrnLookupError("ФНС не нашла организацию или ИП с указанным ИНН.")
-    ogrn_values = {str(row.get("o", "")).strip() for row in exact if row.get("o")}
-    if len(ogrn_values) != 1:
-        raise OgrnLookupError("ФНС не вернула единственный ОГРН. Введите его вручную.")
-    row = exact[0]
-    cached_address = _ADDRESS_CACHE.get(inn, "")
-    address, full_name, address_error = _fetch_statement_details(
-        row, client, headers, timeout
-    )
-    if address:
-        _ADDRESS_CACHE[inn] = address
-    elif cached_address:
-        address = cached_address
-        address_error = ""
-    return FnsRegistrationData(
-        ogrn=ogrn_values.pop(),
-        address=address,
-        address_error=address_error,
-        name=full_name or _registration_name(row.get("n")),
-    )
+        exact = [row for row in rows if normalize_inn(str(row.get("i", ""))) == inn]
+        if not exact:
+            raise OgrnLookupError("ФНС не нашла организацию или ИП с указанным ИНН.")
+        ogrn_values = {str(row.get("o", "")).strip() for row in exact if row.get("o")}
+        if len(ogrn_values) != 1:
+            raise OgrnLookupError("ФНС не вернула единственный ОГРН. Введите его вручную.")
+        row = exact[0]
+        cached_address = _ADDRESS_CACHE.get(inn, "")
+        address, full_name, address_error = _fetch_statement_details(
+            row, client, headers, timeout
+        )
+        if address:
+            _ADDRESS_CACHE[inn] = address
+        elif cached_address:
+            address = cached_address
+            address_error = ""
+        registration = FnsRegistrationData(
+            ogrn=ogrn_values.pop(),
+            address=address,
+            address_error=address_error,
+            name=full_name or _registration_name(row.get("n")),
+        )
+        # Cache only a complete statement result. A temporary CAPTCHA/network
+        # failure must remain retryable when the user presses the button again.
+        if owns_client and registration.address and not registration.address_error:
+            _cache_registration(inn, registration)
+        return registration
+    finally:
+        if owns_client:
+            client.close()
 
 
 def fetch_ogrn(inn_value: str, *, timeout: float = 20.0, session=None) -> str:

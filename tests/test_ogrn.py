@@ -11,6 +11,7 @@ from trademark_report.ogrn import (
     prefer_full_registration_name,
     validate_inn,
 )
+from trademark_report.software_models import is_valid_date_text, is_valid_ogrn
 
 
 class _Response:
@@ -193,3 +194,42 @@ def test_inn_checksum_is_validated():
     assert validate_inn("7707 083 893") == "7707083893"
     with pytest.raises(OgrnLookupError):
         validate_inn("1234567890")
+
+
+def test_ogrn_and_user_entered_dates_are_validated():
+    assert is_valid_ogrn("1027700132195")
+    assert not is_valid_ogrn("1027700132194")
+    assert is_valid_date_text("29.02.2024")
+    assert not is_valid_date_text("29.02.2023")
+    assert not is_valid_date_text("1.02.2024")
+
+
+def test_owned_fns_session_is_closed_and_successful_result_is_cached(monkeypatch):
+    class ClosableSession(_Session):
+        def __init__(self):
+            self.post_count = 0
+            self.closed = False
+
+        def post(self, *args, **kwargs):
+            self.post_count += 1
+            return super().post(*args, **kwargs)
+
+        def close(self):
+            self.closed = True
+
+    session = ClosableSession()
+    ogrn_module._REGISTRATION_CACHE.clear()
+    ogrn_module._ADDRESS_CACHE.clear()
+    monkeypatch.setattr(ogrn_module.requests, "Session", lambda: session)
+    monkeypatch.setattr(
+        ogrn_module,
+        "_pdf_text",
+        lambda _content: "Адрес юридического лица\n117312\n6\nГРН и дата внесения",
+    )
+
+    first = fetch_registration_data("7707083893")
+    second = fetch_registration_data("7707083893")
+
+    assert first == second
+    assert session.post_count == 1
+    assert session.closed is True

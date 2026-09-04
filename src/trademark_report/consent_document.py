@@ -2,23 +2,30 @@
 
 from __future__ import annotations
 
+import re
+import sys
 from copy import deepcopy
 from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
-import re
-import sys
-from tempfile import NamedTemporaryFile, TemporaryDirectory
-from zipfile import ZIP_DEFLATED, ZipFile
+from tempfile import TemporaryDirectory
 
 from docx import Document
+from docx.document import Document as DocumentType
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 from docx.shared import Cm, Pt
-from lxml import etree
+from docx.text.paragraph import Paragraph
 
-from .software_models import SoftwareAuthor, SoftwareConsentData
+from .docx_utils import strip_comments
+from .io_utils import atomic_output_path, atomic_write_bytes
+from .software_models import (
+    APPLICANT_INDIVIDUAL,
+    APPLICANT_SOLE_PROPRIETOR,
+    SoftwareAuthor,
+    SoftwareConsentData,
+)
 
 
 def _resource_root() -> Path:
@@ -29,9 +36,10 @@ def _resource_root() -> Path:
 
 
 DEFAULT_CONSENT_TEMPLATE = _resource_root() / "assets" / "software_consent_template.docx"
+TABLE_WIDTH_EXTENSION = Cm(0.5)
 
 
-def _iter_paragraphs(document: Document):
+def _iter_paragraphs(document: DocumentType):
     yield from document.paragraphs
     for table in document.tables:
         for row in table.rows:
@@ -93,7 +101,7 @@ def _remove_paragraph(paragraph) -> None:
         parent.remove(element)
 
 
-def _expand_table_width(table, extra_width=Cm(0.5)) -> None:
+def _expand_table_width(table, extra_width=TABLE_WIDTH_EXTENSION) -> None:
     """Expand a fixed-width template table while preserving column proportions."""
 
     table_width = table._tbl.tblPr.find(qn("w:tblW"))
@@ -109,7 +117,9 @@ def _expand_table_width(table, extra_width=Cm(0.5)) -> None:
     old_grid_widths = [int(column.get(qn("w:w"), "0")) for column in grid_columns]
     if old_grid_widths and sum(old_grid_widths) > 0:
         remaining = new_width
-        for index, (column, width) in enumerate(zip(grid_columns, old_grid_widths)):
+        for index, (column, width) in enumerate(
+            zip(grid_columns, old_grid_widths, strict=True)
+        ):
             scaled = (
                 remaining
                 if index == len(grid_columns) - 1
@@ -145,7 +155,11 @@ def _passport_text(author: SoftwareAuthor) -> str:
     )
 
 
-def _fill_author_document(document: Document, data: SoftwareConsentData, author: SoftwareAuthor) -> None:
+def _fill_author_document(
+    document: DocumentType,
+    data: SoftwareConsentData,
+    author: SoftwareAuthor,
+) -> None:
     date_text = data.document_date.strftime("%d.%m.%Y")
     birth = None
     try:
@@ -208,7 +222,13 @@ def _fill_author_document(document: Document, data: SoftwareConsentData, author:
             _set_text_preserve(paragraph, data.applicant_address)
             continue
         if text.startswith("ОГРН:"):
-            _set_text_preserve(paragraph, f"ОГРН: {data.ogrn}     ИНН: {data.inn}")
+            if data.applicant_type == APPLICANT_INDIVIDUAL:
+                registration_text = f"ИНН: {data.inn}"
+            elif data.applicant_type == APPLICANT_SOLE_PROPRIETOR:
+                registration_text = f"ОГРНИП: {data.ogrn}     ИНН: {data.inn}"
+            else:
+                registration_text = f"ОГРН: {data.ogrn}     ИНН: {data.inn}"
+            _set_text_preserve(paragraph, registration_text)
             continue
         if text.startswith("Фамилия имя отчество:"):
             _set_text_preserve(paragraph, f"Фамилия имя отчество: {author.full_name}")
@@ -241,6 +261,8 @@ def _fill_author_document(document: Document, data: SoftwareConsentData, author:
         if text.startswith("Подпись") and "ФИО" in text:
             signature_seen += 1
             label = "Подпись автора:" if not page_one else "Подпись"
+            if not page_one:
+                paragraph.insert_paragraph_before(style=paragraph.style)
             _set_text_preserve(paragraph, f"{label} ___________________/ {author.full_name} /")
             continue
         if text == "Дата":
@@ -251,6 +273,15 @@ def _fill_author_document(document: Document, data: SoftwareConsentData, author:
     # A smaller minimum keeps long, unabridged author contributions on page 2.
     if document.tables and len(document.tables[0].rows) >= 6:
         _expand_table_width(document.tables[0])
+        # Reclaim a small amount of unused vertical padding in the title row.
+        # This keeps the form on two pages after enlarging both signature areas.
+        title_row_properties = document.tables[0].rows[2]._tr.get_or_add_trPr()
+        title_row_height = title_row_properties.find(qn("w:trHeight"))
+        if title_row_height is None:
+            title_row_height = OxmlElement("w:trHeight")
+            title_row_properties.append(title_row_height)
+        title_row_height.set(qn("w:val"), "900")
+
         row = document.tables[0].rows[5]
         cell = row.cells[0]
         empty_after_text = False
@@ -264,6 +295,16 @@ def _fill_author_document(document: Document, data: SoftwareConsentData, author:
                 empty_after_text = True
             else:
                 paragraph._element.getparent().remove(paragraph._element)
+        attorney_paragraph = next(
+            (
+                paragraph
+                for paragraph in cell.paragraphs
+                if paragraph.text.strip().startswith("Патентный поверенный")
+            ),
+            None,
+        )
+        if attorney_paragraph is not None:
+            attorney_paragraph._element.addnext(OxmlElement("w:p"))
         tr_pr = row._tr.get_or_add_trPr()
         height = tr_pr.find(qn("w:trHeight"))
         if height is None:
@@ -271,8 +312,21 @@ def _fill_author_document(document: Document, data: SoftwareConsentData, author:
             tr_pr.append(height)
         height.set(qn("w:val"), "1100")
 
+        # Word keeps a structural paragraph after the final table. Make it
+        # minimal so it does not create a visually empty third page.
+        table_tail = document.tables[0]._tbl.getnext()
+        trailing_paragraph = (
+            Paragraph(table_tail, document._body)
+            if table_tail is not None and table_tail.tag == qn("w:p")
+            else None
+        )
+        if trailing_paragraph is not None and not trailing_paragraph.text.strip():
+            trailing_paragraph.paragraph_format.space_before = Pt(0)
+            trailing_paragraph.paragraph_format.space_after = Pt(0)
+            trailing_paragraph.paragraph_format.line_spacing = Pt(1)
 
-def _clear_body(document: Document) -> None:
+
+def _clear_body(document: DocumentType) -> None:
     body = document._element.body
     for child in list(body):
         if child.tag != qn("w:sectPr"):
@@ -291,38 +345,7 @@ def _set_page_break_before(paragraph_element) -> None:
 
 
 def _strip_comments(path: Path) -> None:
-    ns = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
-    with ZipFile(path, "r") as source, NamedTemporaryFile(suffix=".docx", delete=False) as temporary:
-        temp_path = Path(temporary.name)
-        with ZipFile(temporary, "w", ZIP_DEFLATED) as target:
-            for item in source.infolist():
-                name = item.filename
-                if name.startswith("word/comments") or name == "word/people.xml":
-                    continue
-                data = source.read(name)
-                if name == "word/document.xml":
-                    root = etree.fromstring(data)
-                    for tag in ("commentRangeStart", "commentRangeEnd"):
-                        for node in root.xpath(f".//w:{tag}", namespaces=ns):
-                            node.getparent().remove(node)
-                    for node in root.xpath(".//w:commentReference", namespaces=ns):
-                        run = node.getparent()
-                        run.getparent().remove(run)
-                    data = etree.tostring(root, xml_declaration=True, encoding="UTF-8", standalone=True)
-                elif name == "word/_rels/document.xml.rels":
-                    root = etree.fromstring(data)
-                    for relationship in list(root):
-                        if any(part in relationship.get("Type", "") for part in ("comments", "people")):
-                            root.remove(relationship)
-                    data = etree.tostring(root, xml_declaration=True, encoding="UTF-8", standalone=True)
-                elif name == "[Content_Types].xml":
-                    root = etree.fromstring(data)
-                    for override in list(root):
-                        if any(part in override.get("PartName", "") for part in ("comments", "people")):
-                            root.remove(override)
-                    data = etree.tostring(root, xml_declaration=True, encoding="UTF-8", standalone=True)
-                target.writestr(item, data)
-    temp_path.replace(path)
+    atomic_write_bytes(path, strip_comments(path.read_bytes()))
 
 
 def save_consents(
@@ -336,32 +359,38 @@ def save_consents(
     if not template.is_file():
         raise FileNotFoundError(f"Не найден шаблон согласия: {template}")
 
-    final = Document(template)
-    _clear_body(final)
-    body = final._element.body
-    section_properties = body.sectPr
-    for author_index, author in enumerate(data.authors):
-        author_document = Document(template)
-        _fill_author_document(author_document, data, author)
-        children = [
-            deepcopy(child)
-            for child in author_document._element.body
-            if child.tag != qn("w:sectPr")
-        ]
-        if author_index:
-            first_paragraph = next(
-                (child for child in children if child.tag == qn("w:p")),
-                None,
-            )
-            if first_paragraph is not None:
-                _set_page_break_before(first_paragraph)
-        for child in children:
-            body.insert(body.index(section_properties), child)
+    if len(data.authors) == 1:
+        # The normal export path creates one file per author. Editing the
+        # template directly avoids loading and cloning the same DOCX twice.
+        final = Document(str(template))
+        _fill_author_document(final, data, data.authors[0])
+    else:
+        final = Document(str(template))
+        _clear_body(final)
+        body = final._element.body
+        section_properties = body.sectPr
+        for author_index, author in enumerate(data.authors):
+            author_document = Document(str(template))
+            _fill_author_document(author_document, data, author)
+            children = [
+                deepcopy(child)
+                for child in author_document._element.body
+                if child.tag != qn("w:sectPr")
+            ]
+            if author_index:
+                first_paragraph = next(
+                    (child for child in children if child.tag == qn("w:p")),
+                    None,
+                )
+                if first_paragraph is not None:
+                    _set_page_break_before(first_paragraph)
+            for child in children:
+                body.insert(body.index(section_properties), child)
 
     destination = Path(output_path)
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    final.save(destination)
-    _strip_comments(destination)
+    with atomic_output_path(destination) as temporary:
+        final.save(str(temporary))
+        _strip_comments(temporary)
     return destination
 
 
@@ -376,7 +405,7 @@ def _safe_author_name(value: str) -> str:
 def _available_output_path(directory: Path, stem: str, reserved: set[Path]) -> Path:
     candidate = directory / f"{stem}.docx"
     counter = 2
-    while candidate.exists() or candidate in reserved:
+    while candidate.exists() or candidate.is_symlink() or candidate in reserved:
         candidate = directory / f"{stem} ({counter}).docx"
         counter += 1
     reserved.add(candidate)
@@ -416,6 +445,21 @@ def save_author_consents(
                 template_path,
             )
             staged.append(staged_path)
-        for source, destination in zip(staged, destinations):
-            source.replace(destination)
+        committed: list[Path] = []
+        try:
+            for source, destination in zip(staged, destinations, strict=True):
+                # Recheck immediately before the move. This prevents a file
+                # created by another process after reservation from being lost.
+                if destination.exists() or destination.is_symlink():
+                    raise FileExistsError(
+                        f"Файл появился во время сохранения: {destination}"
+                    )
+                source.replace(destination)
+                committed.append(destination)
+        except Exception:
+            # Every committed path was selected as previously non-existent and
+            # was created by this batch, so rolling it back is safe.
+            for destination in committed:
+                destination.unlink(missing_ok=True)
+            raise
     return destinations

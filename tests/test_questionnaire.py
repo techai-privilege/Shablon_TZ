@@ -1,8 +1,11 @@
 from pathlib import Path
 
+import pytest
 from docx import Document
 
+from trademark_report import questionnaire as questionnaire_module
 from trademark_report.questionnaire import parse_questionnaire
+from trademark_report.software_models import APPLICANT_INDIVIDUAL
 
 
 def _questionnaire(path: Path) -> None:
@@ -36,7 +39,7 @@ def _questionnaire(path: Path) -> None:
     ignored.cell(0, 0).text = "РАЗДЕЛ II – СВЕДЕНИЯ О ПО ДЛЯ РЕЕСТРА"
     ignored.cell(1, 0).text = "Наименование программы"
     ignored.cell(1, 1).text = "Это значение нельзя импортировать"
-    document.save(path)
+    document.save(str(path))
 
 
 def test_parser_uses_only_section_one_and_splits_authors(tmp_path):
@@ -57,6 +60,120 @@ def test_parser_uses_only_section_one_and_splits_authors(tmp_path):
     assert result.data.authors[1].full_name == "Петров Петр Петрович"
     assert result.data.authors[1].birth_date == "03.03.1981"
     assert "Это значение нельзя импортировать" not in result.data.program_name
+
+
+def test_parser_reads_standalone_title_and_individual_applicant(tmp_path):
+    path = tmp_path / "individual-applicant.docx"
+    document = Document()
+    document.add_paragraph("Анкета по основным сведениям для регистрации программы")
+    document.add_paragraph("«Программный комплекс Заноза\n(Zanoza Drones)»")
+    table = document.add_table(rows=0, cols=2)
+    for label, value in (
+        ("РАЗДЕЛ I – СВЕДЕНИЯ О ПО ДЛЯ РОСПАТЕНТА", ""),
+        ("Область (сфера) применения ПО", "Радиосвязь"),
+        ("За счет каких средств создано ПО?", "собственных"),
+        ("Заявитель и ИНН", "Анфиногенов Семен Васильевич, ИНН 667803703833"),
+        ("Количество авторов", "1"),
+        (
+            "Паспортные данные авторов",
+            "Автор 1:\n1. Старков Алексей Николаевич\n2. 19.11.2001\n"
+            "3. г. Екатеринбург, ул. Малышева, д. 154\n4. 65 21 461744\n"
+            "5. ГУ МВД России по Свердловской области, 16.02.2022",
+        ),
+        ("Творческий вклад авторов", "Автор 1:\nРазработка всей программы в целом"),
+    ):
+        cells = table.add_row().cells
+        cells[0].text = label
+        cells[1].text = value
+    document.save(path)
+
+    result = parse_questionnaire(path)
+
+    assert result.data.questionnaire_profile_id == "basic_software_questionnaire"
+    assert result.data.program_name == "Программный комплекс Заноза (Zanoza Drones)"
+    assert result.data.applicant_name == "Анфиногенов Семен Васильевич"
+    assert result.data.inn == "667803703833"
+    assert result.data.applicant_type == APPLICANT_INDIVIDUAL
+    assert result.data.ogrn == ""
+    assert result.data.missing_common_fields() == ["адрес заявителя"]
+    assert result.data.authors[0].full_name == "Старков Алексей Николаевич"
+
+
+def test_parser_separates_spaced_inn_and_unlabelled_applicant_address(tmp_path):
+    path = tmp_path / "individual-applicant-with-address.docx"
+    document = Document()
+    table = document.add_table(rows=0, cols=2)
+    for label, value in (
+        ("Наименование программы", "ALGO"),
+        ("Программа создана за счет средств:", "собственных"),
+        (
+            "Наименование заявителя и ИНН",
+            "Дернов Юрий Александрович, ИНН: 6673 5285 5774\n"
+            "620026, Россия, Свердловская обл., г. Екатеринбург, "
+            "ул. Бажова д. 225, кв. 12",
+        ),
+        ("Количество авторов", "1"),
+        (
+            "Паспортные данные Автора 1",
+            "Дернов Юрий Александрович\n01.10.1982\n"
+            "620026, Россия, г. Екатеринбург, ул. Бажова, д. 225\n"
+            "Паспорт серия 6513 номер 690790, выдан Отделом УФМС России, "
+            "дата выдачи: 30.10.2013",
+        ),
+        ("Описание творческого вклада автора 1", "разработка всей программы"),
+    ):
+        cells = table.add_row().cells
+        cells[0].text = label
+        cells[1].text = value
+    document.save(path)
+
+    data = parse_questionnaire(path).data
+
+    assert data.applicant_name == "Дернов Юрий Александрович"
+    assert data.inn == "667352855774"
+    assert data.applicant_address == (
+        "620026, Россия, Свердловская обл., г. Екатеринбург, "
+        "ул. Бажова д. 225, кв. 12"
+    )
+    same_line_name, same_line_address = questionnaire_module._extract_applicant(
+        "Дернов Юрий Александрович, ИНН: 6673 5285 5774, "
+        "620026, Россия, г. Екатеринбург, ул. Бажова, д. 225",
+        "667352855774",
+    )
+    assert same_line_name == "Дернов Юрий Александрович"
+    assert same_line_address == "620026, Россия, г. Екатеринбург, ул. Бажова, д. 225"
+
+
+def test_parser_rejects_oversized_or_invalid_questionnaire(monkeypatch, tmp_path):
+    path = tmp_path / "questionnaire.docx"
+    _questionnaire(path)
+    monkeypatch.setattr(questionnaire_module, "MAX_QUESTIONNAIRE_FILE_BYTES", 1)
+
+    with pytest.raises(ValueError, match="50 МБ"):
+        parse_questionnaire(path)
+
+    wrong_extension = tmp_path / "questionnaire.doc"
+    wrong_extension.write_bytes(b"not a docx")
+    with pytest.raises(ValueError, match="DOCX"):
+        parse_questionnaire(wrong_extension)
+
+
+def test_parser_rejects_unreasonable_declared_author_count(tmp_path):
+    path = tmp_path / "too-many-authors.docx"
+    document = Document()
+    table = document.add_table(rows=0, cols=2)
+    for label, value in (
+        ("РАЗДЕЛ I – СВЕДЕНИЯ О ПО ДЛЯ РОСПАТЕНТА", ""),
+        ("Наименование программы", "Тест"),
+        ("Количество авторов", "101"),
+    ):
+        cells = table.add_row().cells
+        cells[0].text = label
+        cells[1].text = value
+    document.save(path)
+
+    with pytest.raises(ValueError, match="большое число авторов"):
+        parse_questionnaire(path)
 
 
 def test_parser_removes_service_fields_from_passport_issuer(tmp_path):
@@ -662,3 +779,165 @@ def test_parser_keeps_non_passport_warnings_when_authors_are_not_mentioned(tmp_p
 
     author_warnings = [warning for warning in result.warnings if warning.startswith("Автор 1:")]
     assert author_warnings == ["Автор 1: не найдены ФИО, творческий вклад."]
+
+
+def test_parser_matches_named_contributions_and_expands_short_issue_year(tmp_path):
+    path = tmp_path / "combined-passports-and-named-contributions.docx"
+    document = Document()
+    table = document.add_table(rows=0, cols=2)
+    combined_label = (
+        "Если авторы упоминаются, указываются паспортные данные автора 1 "
+        "и описание творческого вклада автора 1"
+    )
+    for label, value in (
+        ("РАЗДЕЛ I – СВЕДЕНИЯ О ПО ДЛЯ РОСПАТЕНТА", ""),
+        ("Наименование программы", "Тестовая программа"),
+        ("Наименование заявителя и ИНН", "ООО «Тест», ИНН 7707083893"),
+        ("Количество авторов", "2"),
+        (
+            combined_label,
+            "1. Иванов Иван Иванович\n"
+            "Дата рождения: 01.01.1980\n"
+            "Паспорт 4510 123456 выдан ГУ МВД России по г. Москве\n"
+            "Дата выдачи: 02.02.2020\n"
+            "Место жительства: г. Москва, ул. Первая, д. 1\n"
+            "2. Петров Петр Петрович\n"
+            "Дата рождения: 03.03.1981\n"
+            "Паспорт 4511 654321 выдан ГУ МВД России по г. Москве\n"
+            "Дата выдачи: 04.04.21\n"
+            "Место жительства: г. Москва, ул. Вторая, д. 2",
+        ),
+        (
+            combined_label,
+            "Петров Петр Петрович — Написание исходного текста программы.\n"
+            "Иванов Иван Иванович — Разработка алгоритма.",
+        ),
+    ):
+        cells = table.add_row().cells
+        cells[0].text = label
+        cells[1].text = value
+    document.save(str(path))
+
+    result = parse_questionnaire(path)
+
+    assert result.data.authors[0].creative_contribution == "Разработка алгоритма"
+    assert result.data.authors[1].creative_contribution == "Написание исходного текста программы"
+    assert result.data.authors[1].passport_issue_date == "04.04.2021"
+
+
+def test_parser_ignores_a_second_example_questionnaire(tmp_path):
+    path = tmp_path / "questionnaire-with-example.docx"
+    document = Document()
+
+    def add_form(
+        program_name: str,
+        author_name: str,
+        passport: str,
+        contribution: str,
+    ) -> None:
+        table = document.add_table(rows=0, cols=2)
+        for label, value in (
+            ("Наименование программы", program_name),
+            ("Область (сфера) применения", "Тестирование"),
+            ("Программа создана за счет средств:", "Собственных"),
+            ("Наименование заявителя и ИНН", "ООО «Тест», ИНН 7707083893"),
+            ("Количество авторов", "1"),
+            (
+                "Паспортные данные Автора 1 и описание творческого вклада автора 1",
+                f"{author_name}, 01.01.1980\n"
+                "г. Москва, ул. Первая, д. 1\n"
+                f"{passport}",
+            ),
+            ("Описание творческого вклада автора 1", contribution),
+        ):
+            cells = table.add_row().cells
+            cells[0].text = label
+            cells[1].text = value
+
+    add_form(
+        "Рабочая программа",
+        "Иванов Иван Иванович",
+        "4510 123456, 02.02.2020, ГУ МВД России по г. Москве",
+        "Разработка алгоритма",
+    )
+    add_form(
+        "Демонстрационный пример",
+        "Петров Петр Петрович",
+        "1111 111111, 03.03.2003, Пример органа выдачи",
+        "Пример вклада",
+    )
+    document.save(str(path))
+
+    result = parse_questionnaire(path)
+    author = result.data.authors[0]
+
+    assert result.data.program_name == "Рабочая программа"
+    assert author.full_name == "Иванов Иван Иванович"
+    assert author.passport_series == "4510"
+    assert author.passport_number == "123456"
+    assert author.passport_issue_date == "02.02.2020"
+    assert author.passport_issuer == "ГУ МВД России по г. Москве"
+    assert author.creative_contribution == "Разработка алгоритма"
+
+
+def test_parser_does_not_join_birth_year_and_postal_code_as_passport(tmp_path):
+    path = tmp_path / "birth-year-before-postal-code.docx"
+    document = Document()
+    table = document.add_table(rows=0, cols=2)
+    for label, value in (
+        ("Наименование программы", "Тестовая программа"),
+        ("Область (сфера) применения", "Тестирование"),
+        ("Программа создана за счет средств:", "Собственных"),
+        ("Наименование заявителя и ИНН", "ООО «Тест», ИНН 7707083893"),
+        ("Количество авторов", "1"),
+        (
+            "Паспортные данные Автора 1",
+            "Иванов Иван Иванович\n"
+            "15.01.1996\n"
+            "127490, Россия, г. Москва, ул. Первая, д. 1\n"
+            "4523 539871, 16.05.2023, ГУ МВД России по г. Москве",
+        ),
+        ("Описание творческого вклада автора 1", "Разработка алгоритма"),
+    ):
+        cells = table.add_row().cells
+        cells[0].text = label
+        cells[1].text = value
+    document.save(str(path))
+
+    author = parse_questionnaire(path).data.authors[0]
+
+    assert author.passport_series == "4523"
+    assert author.passport_number == "539871"
+    assert author.passport_issue_date == "16.05.2023"
+
+
+def test_parser_removes_year_suffix_and_subdivision_code_from_issuer(tmp_path):
+    path = tmp_path / "passport-issued-year-suffix.docx"
+    document = Document()
+    table = document.add_table(rows=0, cols=2)
+    for label, value in (
+        ("Наименование программы", "Тестовая программа"),
+        ("Область (сфера) применения", "Тестирование"),
+        ("Программа создана за счет средств:", "Собственных"),
+        ("Наименование заявителя и ИНН", "ООО «Тест», ИНН 7707083893"),
+        ("Количество авторов", "1"),
+        (
+            "Паспортные данные Автора 1",
+            "Иванов Иван Иванович\n"
+            "01.01.1980\n"
+            "г. Москва, ул. Первая, д. 1\n"
+            "Паспорт гражданина РФ, серия 1801 № 484484, "
+            "выдан 23.07. 2001 года Советским РОВД гор. Волгограда, "
+            "к.п. 342-006",
+        ),
+        ("Описание творческого вклада автора 1", "Разработка алгоритма"),
+    ):
+        cells = table.add_row().cells
+        cells[0].text = label
+        cells[1].text = value
+    document.save(str(path))
+
+    author = parse_questionnaire(path).data.authors[0]
+
+    assert author.passport_issue_date == "23.07.2001"
+    assert author.passport_issuer == "Советским РОВД гор. Волгограда"

@@ -1,5 +1,6 @@
-from trademark_report.fips import FipsParseError, parse_trademark_html
+import pytest
 
+from trademark_report.fips import FipsParseError, fetch_trademark, parse_trademark_html
 
 SOURCE_URL = (
     "https://new.fips.ru/registers-doc-view/"
@@ -118,3 +119,29 @@ def test_legacy_www1_fips_card_url_is_supported():
 
     assert record.database == "RUTM"
     assert record.owner == "ООО «АЙЛЭНД» (RU)"
+
+
+class _Response:
+    def __init__(self, content: bytes, url: str, content_type: str):
+        self.content = content
+        self.url = url
+        self.headers = {"Content-Type": content_type}
+
+    def raise_for_status(self):
+        return None
+
+
+class _InvalidImageSession:
+    def __init__(self):
+        self.calls = 0
+
+    def get(self, url, **kwargs):
+        self.calls += 1
+        if self.calls == 1:
+            return _Response(SAMPLE_HTML.encode("windows-1251"), SOURCE_URL, "text/html")
+        return _Response(b"not-an-image", url, "text/html")
+
+
+def test_fetch_rejects_non_image_response_from_fips():
+    with pytest.raises(FipsParseError, match="изображен"):
+        fetch_trademark(SOURCE_URL, session=_InvalidImageSession())

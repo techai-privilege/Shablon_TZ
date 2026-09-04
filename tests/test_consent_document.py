@@ -1,4 +1,5 @@
 from datetime import date
+from pathlib import Path
 from zipfile import ZipFile
 
 from docx import Document
@@ -10,7 +11,11 @@ from trademark_report.consent_document import (
     save_author_consents,
     save_consents,
 )
-from trademark_report.software_models import SoftwareAuthor, SoftwareConsentData
+from trademark_report.software_models import (
+    APPLICANT_INDIVIDUAL,
+    SoftwareAuthor,
+    SoftwareConsentData,
+)
 
 
 def _data() -> SoftwareConsentData:
@@ -103,9 +108,37 @@ def test_combined_consents_preserve_template_and_remove_comments(tmp_path):
     ]
     assert table_widths == [10244, 10244]
 
+    author_signature_cell = document.tables[0].rows[4].cells[0]
+    author_signature_index = next(
+        index
+        for index, paragraph in enumerate(author_signature_cell.paragraphs)
+        if paragraph.text.startswith("Подпись автора:")
+    )
+    assert sum(
+        not paragraph.text.strip()
+        for paragraph in author_signature_cell.paragraphs[:author_signature_index]
+    ) == 3
+
+    attorney_cell = document.tables[0].rows[5].cells[0]
+    assert attorney_cell.paragraphs[0].text.startswith("Патентный поверенный")
+    assert not attorney_cell.paragraphs[1].text.strip()
+    assert not attorney_cell.paragraphs[2].text.strip()
+    assert attorney_cell.paragraphs[3].text == "26.08.2026"
+    title_row_height = document.tables[0].rows[2]._tr.trPr.find(qn("w:trHeight"))
+    assert title_row_height.get(qn("w:val")) == "900"
+
+    for table in document.tables:
+        following_element = table._tbl.getnext()
+        assert following_element.tag == qn("w:p")
+        spacing = following_element.find(f"{qn('w:pPr')}/{qn('w:spacing')}")
+        assert spacing.get(qn("w:before")) == "0"
+        assert spacing.get(qn("w:after")) == "0"
+        assert spacing.get(qn("w:line")) == "20"
+
     with ZipFile(output) as archive:
         names = set(archive.namelist())
         assert "word/comments.xml" not in names
+        assert not any("comments" in name.casefold() for name in names)
         assert b"commentReference" not in archive.read("word/document.xml")
 
 
@@ -136,8 +169,8 @@ def test_separate_consent_is_created_for_each_author(tmp_path):
         "Согласие Иванов Иван Иванович.docx",
         "Согласие Петров Петр Петрович.docx",
     ]
-    first = Document(paths[0])
-    second = Document(paths[1])
+    first = Document(str(paths[0]))
+    second = Document(str(paths[1]))
     first_text = "\n".join(paragraph.text for paragraph in first.paragraphs)
     second_text = "\n".join(paragraph.text for paragraph in second.paragraphs)
     assert len(first.tables) == 1
@@ -156,3 +189,46 @@ def test_separate_consents_do_not_overwrite_existing_files(tmp_path):
 
     assert existing.read_bytes() == b"existing"
     assert paths[0].name == "Согласие Иванов Иван Иванович (2).docx"
+
+
+def test_separate_consent_batch_is_rolled_back_if_commit_fails(monkeypatch, tmp_path):
+    original_replace = Path.replace
+
+    def failing_replace(source, destination):
+        if Path(destination).name == "Согласие Петров Петр Петрович.docx":
+            raise OSError("simulated disk failure")
+        return original_replace(source, destination)
+
+    monkeypatch.setattr(Path, "replace", failing_replace)
+
+    try:
+        save_author_consents(_data(), tmp_path)
+    except OSError:
+        pass
+    else:
+        raise AssertionError("Expected a simulated save failure")
+
+    assert not list(tmp_path.glob("Согласие *.docx"))
+
+
+def test_individual_applicant_document_uses_inn_without_ogrn(tmp_path):
+    output = tmp_path / "individual.docx"
+    data = _data()
+    data.applicant_type = APPLICANT_INDIVIDUAL
+    data.applicant_name = "Анфиногенов Семен Васильевич"
+    data.applicant_address = "Россия, г. Екатеринбург, ул. Рощинская, д. 59"
+    data.inn = "667803703833"
+    data.ogrn = ""
+
+    save_consents(data, output)
+
+    document = Document(output)
+    text = "\n".join(paragraph.text for paragraph in document.paragraphs)
+    text += "\n" + "\n".join(
+        cell.text for table in document.tables for row in table.rows for cell in row.cells
+    )
+    assert "Анфиногенов Семен Васильевич" in text
+    assert "ИНН: 667803703833" in text
+    assert "ОГРН:" not in text
+    assert "125993" in text
+    assert "119991" not in text

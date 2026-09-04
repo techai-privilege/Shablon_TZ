@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
 import re
+from dataclasses import dataclass, field
 from urllib.parse import urljoin, urlparse
 
-from bs4 import BeautifulSoup, Tag
 import requests
+from bs4 import BeautifulSoup, Tag
 
+from .network import MAX_PAGE_BYTES, GetSession, checked_image_content, limited_response_content
 
 ALLOWED_FIPS_HOSTS = {"fips.ru", "www.fips.ru", "www1.fips.ru", "new.fips.ru"}
 DEFAULT_TIMEOUT_SECONDS = 25
@@ -62,7 +63,13 @@ def _clean(value: str | None) -> str | None:
 
 def _validate_fips_url(url: str) -> str:
     parsed = urlparse(url.strip())
-    if parsed.scheme != "https" or (parsed.hostname or "").lower() not in ALLOWED_FIPS_HOSTS:
+    if (
+        parsed.scheme != "https"
+        or (parsed.hostname or "").lower() not in ALLOWED_FIPS_HOSTS
+        or parsed.port not in (None, 443)
+        or parsed.username
+        or parsed.password
+    ):
         raise FipsParseError("Нужна HTTPS-ссылка на публичную карточку сайта fips.ru.")
     supported_path = (
         "registers-doc-view" in parsed.path or "fips_servl" in parsed.path
@@ -137,7 +144,7 @@ def _find_mark_image_url(soup: BeautifulSoup, source_url: str) -> str | None:
     sources = [link.get("href") for link in container.find_all("a")]
     sources.extend(image.get("src") for image in container.find_all("img"))
     for source in sources:
-        if not source:
+        if not isinstance(source, str) or not source:
             continue
         candidate = urljoin(source_url, source)
         parsed = urlparse(candidate)
@@ -218,30 +225,43 @@ def fetch_trademark(
     url: str,
     *,
     include_image: bool = True,
-    session: requests.Session | None = None,
+    session: GetSession | None = None,
     timeout: int = DEFAULT_TIMEOUT_SECONDS,
 ) -> TrademarkRecord:
     """Download and parse a public FIPS card, optionally including its image."""
 
     url = _validate_fips_url(url)
+    owns_client = session is None
     client = session or requests.Session()
     headers = {"User-Agent": USER_AGENT, "Accept-Language": "ru-RU,ru;q=0.9"}
     try:
-        response = client.get(url, headers=headers, timeout=timeout)
-        response.raise_for_status()
-    except requests.RequestException as exc:
-        raise FipsParseError(f"Не удалось загрузить карточку ФИПС: {exc}") from exc
-
-    record = parse_trademark_html(response.content, response.url)
-    if include_image and record.image_url:
-        image_host = (urlparse(record.image_url).hostname or "").lower()
-        if image_host not in ALLOWED_FIPS_HOSTS:
-            raise FipsParseError("Карточка содержит изображение с неподдерживаемого сайта.")
         try:
-            image_response = client.get(record.image_url, headers=headers, timeout=timeout)
-            image_response.raise_for_status()
-        except requests.RequestException as exc:
-            raise FipsParseError(f"Данные карточки получены, но изображение не загрузилось: {exc}") from exc
-        record.image_bytes = image_response.content
-        record.image_content_type = image_response.headers.get("Content-Type")
-    return record
+            response = client.get(url, headers=headers, timeout=timeout)
+            response.raise_for_status()
+            page = limited_response_content(response, MAX_PAGE_BYTES, "Страница ФИПС")
+        except (requests.RequestException, ValueError) as exc:
+            raise FipsParseError(f"Не удалось загрузить карточку ФИПС: {exc}") from exc
+
+        record = parse_trademark_html(page, response.url)
+        if include_image and record.image_url:
+            parsed_image = urlparse(record.image_url)
+            if (
+                parsed_image.scheme != "https"
+                or (parsed_image.hostname or "").lower() not in ALLOWED_FIPS_HOSTS
+                or parsed_image.port not in (None, 443)
+                or parsed_image.username
+                or parsed_image.password
+            ):
+                raise FipsParseError("Карточка содержит изображение с неподдерживаемого сайта.")
+            try:
+                image_response = client.get(record.image_url, headers=headers, timeout=timeout)
+                image_response.raise_for_status()
+                image_bytes, content_type = checked_image_content(image_response, "ФИПС")
+            except (requests.RequestException, ValueError) as exc:
+                raise FipsParseError(f"Данные карточки получены, но изображение не загрузилось: {exc}") from exc
+            record.image_bytes = image_bytes
+            record.image_content_type = content_type
+        return record
+    finally:
+        if owns_client and isinstance(client, requests.Session):
+            client.close()

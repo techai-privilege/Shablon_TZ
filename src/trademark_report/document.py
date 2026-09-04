@@ -2,22 +2,31 @@
 
 from __future__ import annotations
 
+import sys
 from io import BytesIO
 from pathlib import Path
-import re
-import sys
-from zipfile import ZIP_DEFLATED, ZipFile
+from typing import cast
 
 from docx import Document
+from docx.document import Document as DocumentType
 from docx.enum.table import WD_CELL_VERTICAL_ALIGNMENT, WD_TABLE_ALIGNMENT
 from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_BREAK
+from docx.opc.constants import RELATIONSHIP_TYPE as RT
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
-from docx.opc.constants import RELATIONSHIP_TYPE as RT
 from docx.shared import Cm, Pt, RGBColor
+from docx.styles.style import ParagraphStyle
 
+from .docx_utils import strip_comments
 from .fees import calculate_fees, class_word, format_rubles
-from .models import ConclusionParagraph, ConclusionRun, PERFORMERS, ReportData, SimilarRecord
+from .io_utils import atomic_write_bytes
+from .models import (
+    PERFORMERS,
+    ConclusionParagraph,
+    ConclusionRun,
+    ReportData,
+    SimilarRecord,
+)
 from .templates import conclusion_paragraphs
 
 
@@ -40,7 +49,7 @@ GRAY = RGBColor(0x80, 0x80, 0x80)
 PINK = "F085AD"
 
 
-def _clear_body(document: Document) -> None:
+def _clear_body(document: DocumentType) -> None:
     body = document._element.body
     for child in list(body):
         if child.tag != qn("w:sectPr"):
@@ -181,13 +190,13 @@ def _add_hyperlink(paragraph, text: str, url: str, *, size=11, bold=False) -> No
     paragraph._p.append(hyperlink)
 
 
-def _add_page_break(document: Document) -> None:
+def _add_page_break(document: DocumentType) -> None:
     paragraph = document.add_paragraph()
     paragraph.paragraph_format.space_after = Pt(0)
     paragraph.add_run().add_break(WD_BREAK.PAGE)
 
 
-def _add_title(document: Document, report: ReportData) -> None:
+def _add_title(document: DocumentType, report: ReportData) -> None:
     date_paragraph = document.add_paragraph()
     _format_paragraph(date_paragraph, after=16, alignment=WD_ALIGN_PARAGRAPH.RIGHT)
     date_run = _set_font(date_paragraph.add_run(f"Дата отчета {report.report_date:%d.%m.%Y}"), 11)
@@ -199,7 +208,7 @@ def _add_title(document: Document, report: ReportData) -> None:
     _set_font(title.add_run(f"регистрации товарного знака «{report.designation}»"), 11, bold=True)
 
 
-def _add_summary(document: Document, report: ReportData) -> None:
+def _add_summary(document: DocumentType, report: ReportData) -> None:
     table = document.add_table(rows=0, cols=2)
     summary_fields = [("Поисковые запросы", report.search_queries)]
     if report.business_area.strip():
@@ -257,7 +266,7 @@ def _add_summary(document: Document, report: ReportData) -> None:
     _prepare_table(grounds, [5.3, 11.7])
 
 
-def _add_conclusion(document: Document, report: ReportData) -> None:
+def _add_conclusion(document: DocumentType, report: ReportData) -> None:
     header = document.add_table(rows=1, cols=1)
     _set_cell_shading(header.cell(0, 0), GREEN_FILL)
     _cell_text(header.cell(0, 0), "ЗАКЛЮЧЕНИЕ", bold=True, alignment=WD_ALIGN_PARAGRAPH.CENTER)
@@ -330,14 +339,14 @@ def _add_conclusion(document: Document, report: ReportData) -> None:
     _add_hyperlink(signature, "www.patentural.ru", "https://www.patentural.ru/", size=11)
 
 
-def _add_section_caption(document: Document, text: str) -> None:
+def _add_section_caption(document: DocumentType, text: str) -> None:
     table = document.add_table(rows=1, cols=1)
     _set_cell_shading(table.cell(0, 0), BLUE_FILL)
     _cell_text(table.cell(0, 0), text, bold=True, alignment=WD_ALIGN_PARAGRAPH.CENTER)
     _prepare_table(table, [17.0])
 
 
-def _add_record_table(document: Document, record: SimilarRecord) -> None:
+def _add_record_table(document: DocumentType, record: SimilarRecord) -> None:
     if record.kind == "international":
         fields = [
             ("Номер регистрации:", record.number),
@@ -388,7 +397,7 @@ def _add_record_table(document: Document, record: SimilarRecord) -> None:
     _format_paragraph(paragraph, after=1)
 
 
-def _add_appendix(document: Document, report: ReportData) -> None:
+def _add_appendix(document: DocumentType, report: ReportData) -> None:
     heading = document.add_paragraph()
     _format_paragraph(heading, after=14, alignment=WD_ALIGN_PARAGRAPH.RIGHT)
     _set_font(heading.add_run("Приложение 1"), 11, bold=True)
@@ -406,7 +415,7 @@ def _add_appendix(document: Document, report: ReportData) -> None:
             _add_record_table(document, record)
 
 
-def _add_fees(document: Document, report: ReportData) -> None:
+def _add_fees(document: DocumentType, report: ReportData) -> None:
     class_count = max(len(report.nice_classes), 1)
     fees = calculate_fees(class_count)
 
@@ -515,36 +524,6 @@ def _add_fees(document: Document, report: ReportData) -> None:
     _set_table_borders(social, color=PINK, size=0, top=24, bottom=24)
 
 
-def _strip_comment_parts(docx_bytes: bytes) -> bytes:
-    output = BytesIO()
-    removable = {
-        "word/comments.xml",
-        "word/commentsExtended.xml",
-        "word/commentsExtensible.xml",
-        "word/commentsIds.xml",
-        "word/people.xml",
-    }
-    with ZipFile(BytesIO(docx_bytes), "r") as source, ZipFile(output, "w", ZIP_DEFLATED) as target:
-        for item in source.infolist():
-            if item.filename in removable:
-                continue
-            data = source.read(item.filename)
-            if item.filename == "word/_rels/document.xml.rels":
-                text = data.decode("utf-8")
-                text = re.sub(
-                    r'<Relationship\b[^>]+Type="[^"]+/(?:comments|commentsExtended|commentsExtensible|commentsIds|people)"[^>]*/>',
-                    "",
-                    text,
-                )
-                data = text.encode("utf-8")
-            elif item.filename == "[Content_Types].xml":
-                text = data.decode("utf-8")
-                text = re.sub(r'<Override\b[^>]+PartName="/word/(?:comments[^"/]*|people)\.xml"[^>]*/>', "", text)
-                data = text.encode("utf-8")
-            target.writestr(item, data)
-    return output.getvalue()
-
-
 def generate_report(report: ReportData, template_path: str | Path = DEFAULT_TEMPLATE) -> bytes:
     """Create a DOCX report and return its bytes."""
 
@@ -554,14 +533,17 @@ def generate_report(report: ReportData, template_path: str | Path = DEFAULT_TEMP
     if not report.designation.strip() or not report.search_queries.strip():
         raise ValueError("Обозначение и поисковые запросы обязательны.")
 
-    document = Document(template_path)
+    document = Document(str(template_path))
     _clear_body(document)
 
-    normal = document.styles["Normal"]
+    normal = cast(ParagraphStyle, document.styles["Normal"])
     normal.font.name = "Calibri"
-    normal.font.size = Pt(10.5)
-    normal._element.rPr.rFonts.set(qn("w:ascii"), "Calibri")
-    normal._element.rPr.rFonts.set(qn("w:hAnsi"), "Calibri")
+    normal.font.size = Pt(11)
+    style_element = normal._element
+    if style_element is not None:
+        style_fonts = style_element.get_or_add_rPr().get_or_add_rFonts()
+        style_fonts.set(qn("w:ascii"), "Calibri")
+        style_fonts.set(qn("w:hAnsi"), "Calibri")
     normal.paragraph_format.space_after = Pt(5)
 
     _add_title(document, report)
@@ -576,11 +558,9 @@ def generate_report(report: ReportData, template_path: str | Path = DEFAULT_TEMP
 
     buffer = BytesIO()
     document.save(buffer)
-    return _strip_comment_parts(buffer.getvalue())
+    return strip_comments(buffer.getvalue())
 
 
 def save_report(report: ReportData, output_path: str | Path, template_path: str | Path = DEFAULT_TEMPLATE) -> Path:
     output_path = Path(output_path)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_bytes(generate_report(report, template_path))
-    return output_path
+    return atomic_write_bytes(output_path, generate_report(report, template_path))

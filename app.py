@@ -2,13 +2,23 @@
 
 from __future__ import annotations
 
-from datetime import date
 import json
-from pathlib import Path
 import re
 import sys
+from datetime import date
+from pathlib import Path
 
-from PySide6.QtCore import QDate, QObject, QPoint, QRect, QThread, QTimer, Qt, Signal, Slot
+from PySide6.QtCore import (
+    QDate,
+    QObject,
+    QPoint,
+    QRect,
+    Qt,
+    QThread,
+    QTimer,
+    Signal,
+    Slot,
+)
 from PySide6.QtGui import (
     QColor,
     QFont,
@@ -16,7 +26,6 @@ from PySide6.QtGui import (
     QPalette,
     QPixmap,
     QTextCharFormat,
-    QTextCursor,
     QTextListFormat,
 )
 from PySide6.QtWidgets import (
@@ -29,8 +38,8 @@ from PySide6.QtWidgets import (
     QFormLayout,
     QFrame,
     QGroupBox,
-    QHeaderView,
     QHBoxLayout,
+    QHeaderView,
     QLabel,
     QLineEdit,
     QListWidget,
@@ -39,9 +48,9 @@ from PySide6.QtWidgets import (
     QPushButton,
     QScrollArea,
     QStackedWidget,
-    QTabWidget,
     QTableWidget,
     QTableWidgetItem,
+    QTabWidget,
     QTextEdit,
     QVBoxLayout,
     QWidget,
@@ -49,28 +58,39 @@ from PySide6.QtWidgets import (
 
 from trademark_report.document import save_report
 from trademark_report.fips import FipsParseError, TrademarkRecord, fetch_trademark
-from trademark_report.wipo import WipoParseError, fetch_wipo_trademark
 from trademark_report.models import (
     CONCLUSION_VALUES,
-    ConclusionParagraph,
-    ConclusionRun,
     PERFORMERS,
     PROBABILITY_VALUES,
     RELATIVE_OPTIONS,
+    ConclusionParagraph,
+    ConclusionRun,
     ProbabilityEntry,
     ReportData,
     ReportNiceClass,
     SimilarRecord,
 )
-from trademark_report.templates import conclusion_paragraphs
+from trademark_report.network import MAX_IMAGE_BYTES
+from trademark_report.software_models import is_valid_date_text
 from trademark_report.software_widget import SoftwareConsentWidget
-
+from trademark_report.templates import conclusion_paragraphs
+from trademark_report.wipo import WipoParseError, fetch_wipo_trademark
 
 ROOT = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
 
 
 def _load_classes() -> dict[str, str]:
-    return json.loads((ROOT / "data" / "nice_classes.json").read_text(encoding="utf-8"))
+    path = ROOT / "data" / "nice_classes.json"
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"Не удалось прочитать справочник МКТУ: {path}") from exc
+    expected = {str(number).zfill(2) for number in range(1, 46)}
+    if not isinstance(payload, dict) or set(payload) != expected or not all(
+        isinstance(value, str) and value.strip() for value in payload.values()
+    ):
+        raise RuntimeError("Справочник МКТУ поврежден или содержит не все классы 01–45.")
+    return payload
 
 
 def _scrollable(widget: QWidget) -> QScrollArea:
@@ -88,16 +108,22 @@ class BackgroundWidget(QWidget):
         super().__init__()
         self.setObjectName("appBackground")
         self._background = QPixmap(str(image_path))
+        self._scaled_background = QPixmap()
+        self._scaled_for_size = (-1, -1)
 
     def paintEvent(self, event) -> None:  # noqa: N802 - Qt naming convention
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
         if not self._background.isNull():
-            scaled = self._background.scaled(
-                self.size(),
-                Qt.AspectRatioMode.KeepAspectRatioByExpanding,
-                Qt.TransformationMode.SmoothTransformation,
-            )
+            current_size = (self.width(), self.height())
+            if current_size != self._scaled_for_size:
+                self._scaled_background = self._background.scaled(
+                    self.size(),
+                    Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+                    Qt.TransformationMode.SmoothTransformation,
+                )
+                self._scaled_for_size = current_size
+            scaled = self._scaled_background
             left = max(0, (scaled.width() - self.width()) // 2)
             top = max(0, (scaled.height() - self.height()) // 2)
             source = QRect(left, top, self.width(), self.height())
@@ -211,11 +237,11 @@ class RecordCard(QGroupBox):
         image_actions = QVBoxLayout()
         choose = QPushButton("Выбрать изображение")
         choose.clicked.connect(self._choose_image)
-        remove = QPushButton("Удалить карточку")
-        remove.setProperty("secondary", True)
-        remove.clicked.connect(lambda: self.remove_requested.emit(self))
+        self.remove_button = QPushButton("Удалить карточку")
+        self.remove_button.setProperty("secondary", True)
+        self.remove_button.clicked.connect(lambda: self.remove_requested.emit(self))
         image_actions.addWidget(choose)
-        image_actions.addWidget(remove)
+        image_actions.addWidget(self.remove_button)
         image_actions.addStretch()
         image_row.addWidget(self.image, 1)
         image_row.addLayout(image_actions)
@@ -239,7 +265,23 @@ class RecordCard(QGroupBox):
             "Изображения (*.png *.jpg *.jpeg)",
         )
         if path:
-            self.image_bytes = Path(path).read_bytes()
+            try:
+                content = Path(path).read_bytes()
+            except OSError as exc:
+                QMessageBox.warning(self, "Не удалось открыть файл", str(exc))
+                return
+            if len(content) > MAX_IMAGE_BYTES:
+                QMessageBox.warning(
+                    self,
+                    "Слишком большое изображение",
+                    "Выберите файл размером не более 15 МБ.",
+                )
+                return
+            pixmap = QPixmap()
+            if not pixmap.loadFromData(content):
+                QMessageBox.warning(self, "Неверный файл", "Выбранный файл не является изображением.")
+                return
+            self.image_bytes = content
             self._show_image()
 
     def _show_image(self) -> None:
@@ -257,6 +299,8 @@ class RecordCard(QGroupBox):
             self.image.setText("Изображение отсутствует")
 
     def _fetch(self) -> None:
+        if self.is_fetching():
+            return
         url = self.url.text().strip()
         if not url:
             QMessageBox.warning(
@@ -264,6 +308,7 @@ class RecordCard(QGroupBox):
             )
             return
         self.fetch_button.setEnabled(False)
+        self.remove_button.setEnabled(False)
         self.fetch_button.setText("Загрузка…")
         self.message.emit(f"Загружаю карточку {self.source_name}…")
 
@@ -277,6 +322,7 @@ class RecordCard(QGroupBox):
         self._worker.failed.connect(self._thread.quit)
         self._thread.finished.connect(self._worker.deleteLater)
         self._thread.finished.connect(self._thread.deleteLater)
+        self._thread.finished.connect(self._thread_finished)
         self._thread.start()
 
     @Slot(object)
@@ -314,9 +360,27 @@ class RecordCard(QGroupBox):
         QMessageBox.critical(self, f"Ошибка {self.source_name}", message)
 
     def _finish_fetch(self, message: str) -> None:
+        self.message.emit(message)
+
+    @Slot()
+    def _thread_finished(self) -> None:
+        self._worker = None
+        self._thread = None
         self.fetch_button.setEnabled(True)
         self.fetch_button.setText(f"Заполнить из {self.source_name}")
-        self.message.emit(message)
+        self.remove_button.setEnabled(True)
+
+    def is_fetching(self) -> bool:
+        return bool(self._thread and self._thread.isRunning())
+
+    def stop_worker(self) -> None:
+        """Wait until a finite-time network request releases its Qt thread."""
+
+        thread = self._thread
+        if thread and thread.isRunning():
+            thread.requestInterruption()
+            thread.quit()
+            thread.wait()
 
     def value(self) -> SimilarRecord:
         return SimilarRecord(
@@ -338,6 +402,7 @@ class RecordList(QWidget):
 
     def __init__(self, title: str, kind: str):
         super().__init__()
+        self.title = title
         self.kind = kind
         self.cards: list[RecordCard] = []
         layout = QVBoxLayout(self)
@@ -367,6 +432,9 @@ class RecordList(QWidget):
 
     @Slot(object)
     def remove_card(self, card: RecordCard) -> None:
+        if card.is_fetching():
+            self.message.emit("Дождитесь завершения загрузки перед удалением карточки.")
+            return
         self.cards.remove(card)
         card.deleteLater()
         for index, item in enumerate(self.cards, 1):
@@ -380,6 +448,37 @@ class RecordList(QWidget):
             if value.number or value.source_url or value.display_name:
                 result.append(value)
         return result
+
+    def validation_error(self) -> str | None:
+        for index, value in enumerate(self.values(), 1):
+            label = f"Карточка {index} в разделе «{self.title}»"
+            required = [
+                ("номер", value.number),
+                ("дата", value.relevant_date),
+                ("владелец/заявитель", value.owner_or_applicant),
+                ("классы МКТУ", value.related_classes),
+            ]
+            if self.kind == "application":
+                required.append(("статус", value.status))
+            missing = [name for name, field_value in required if not field_value.strip()]
+            if missing:
+                return f"{label}: заполните {', '.join(missing)}."
+            if not is_valid_date_text(value.relevant_date):
+                return f"{label}: дата должна быть в формате ДД.ММ.ГГГГ."
+            class_values = re.findall(r"\d+", value.related_classes)
+            if (
+                not class_values
+                or any(not 1 <= int(number) <= 45 for number in class_values)
+                or re.sub(r"[\d\s,;]+", "", value.related_classes)
+            ):
+                return f"{label}: укажите классы МКТУ числами от 1 до 45."
+            if not value.display_name.strip() and not value.image_bytes:
+                return f"{label}: укажите обозначение или выберите изображение."
+        return None
+
+    def stop_workers(self) -> None:
+        for card in self.cards:
+            card.stop_worker()
 
 
 class MainWindow(QMainWindow):
@@ -549,7 +648,7 @@ class MainWindow(QMainWindow):
         self.conclusion.addItems(CONCLUSION_VALUES)
         self.conclusion.currentTextChanged.connect(self._conclusion_template_changed)
         self.performer = QComboBox()
-        self.performer.addItems(PERFORMERS)
+        self.performer.addItems(list(PERFORMERS))
         form.addRow("Шаблон заключения *:", self.conclusion)
         form.addRow("Кто готовил отчет *:", self.performer)
         layout.addWidget(box)
@@ -639,6 +738,10 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event) -> None:  # noqa: N802 - Qt naming convention
         if hasattr(self, "software_page"):
             self.software_page.stop_workers()
+        for name in ("international", "russian", "applications"):
+            record_list = getattr(self, name, None)
+            if record_list is not None:
+                record_list.stop_workers()
         super().closeEvent(event)
 
     def _conclusion_template_report(self) -> ReportData:
@@ -769,7 +872,8 @@ class MainWindow(QMainWindow):
     def _add_class(self) -> None:
         number = self.class_selector.currentData()
         for row in range(self.class_table.rowCount()):
-            if self.class_table.item(row, 0).text() == number:
+            number_item = self.class_table.item(row, 0)
+            if number_item is not None and number_item.text() == number:
                 self.class_table.selectRow(row)
                 return
         row = self.class_table.rowCount()
@@ -812,19 +916,25 @@ class MainWindow(QMainWindow):
                 self.probability_table.removeRow(row)
 
     def _nice_classes(self) -> list[ReportNiceClass]:
-        return [
-            ReportNiceClass(
-                self.class_table.item(row, 0).text().strip(),
-                self.class_table.item(row, 1).text().strip() if self.class_table.item(row, 1) else "",
+        result: list[ReportNiceClass] = []
+        for row in range(self.class_table.rowCount()):
+            number_item = self.class_table.item(row, 0)
+            description_item = self.class_table.item(row, 1)
+            result.append(
+                ReportNiceClass(
+                    number_item.text().strip() if number_item is not None else "",
+                    description_item.text().strip() if description_item is not None else "",
+                )
             )
-            for row in range(self.class_table.rowCount())
-        ]
+        return result
 
     def _probabilities(self) -> list[ProbabilityEntry]:
         result = []
         for row in range(self.probability_table.rowCount()):
             subject_item = self.probability_table.item(row, 0)
             value_widget = self.probability_table.cellWidget(row, 1)
+            if not isinstance(value_widget, QComboBox):
+                continue
             result.append(
                 ProbabilityEntry(
                     value=value_widget.currentText(),
@@ -845,10 +955,19 @@ class MainWindow(QMainWindow):
             return "Заполните описание каждого выбранного класса МКТУ."
         if not self.tm_database_date.text().strip() or not self.app_database_date.text().strip():
             return "Заполните даты обновления обеих баз."
+        for label, value in (
+            ("базы товарных знаков", self.tm_database_date.text()),
+            ("базы заявок", self.app_database_date.text()),
+        ):
+            if not is_valid_date_text(value):
+                return f"Дата обновления {label} должна быть в формате ДД.ММ.ГГГГ."
         if self.absolute_checkbox.isChecked() and not self.absolute_text.toPlainText().strip():
             return "Добавьте формулировку абсолютных оснований."
         if not self.conclusion_preview.toPlainText().strip():
             return "Заключение не может быть пустым."
+        for record_list in (self.international, self.russian, self.applications):
+            if error := record_list.validation_error():
+                return error
         return None
 
     def _report(self) -> ReportData:
@@ -902,7 +1021,7 @@ class MainWindow(QMainWindow):
 
     def _apply_style(self) -> None:
         application = QApplication.instance()
-        if application is not None:
+        if isinstance(application, QApplication):
             application.setStyle("Fusion")
             palette = QPalette()
             palette.setColor(QPalette.ColorRole.Window, QColor("#f4f6f8"))
@@ -1056,9 +1175,22 @@ def _bring_window_to_front(app: QApplication, window: MainWindow) -> None:
 
 
 def main() -> int:
-    app = QApplication.instance() or QApplication(sys.argv)
+    existing_application = QApplication.instance()
+    app = (
+        existing_application
+        if isinstance(existing_application, QApplication)
+        else QApplication(sys.argv)
+    )
     app.setApplicationName("Документы по интеллектуальной собственности")
-    window = MainWindow()
+    try:
+        window = MainWindow()
+    except Exception as exc:  # pragma: no cover - startup boundary
+        QMessageBox.critical(
+            None,
+            "Не удалось запустить программу",
+            f"Проверьте целостность файлов программы.\n\n{exc}",
+        )
+        return 1
     window.show()
     QTimer.singleShot(0, lambda: _bring_window_to_front(app, window))
     return app.exec()
@@ -1070,6 +1202,7 @@ def _packaged_self_test() -> int:
     from tempfile import TemporaryDirectory
 
     from trademark_report.consent_document import save_consents
+    from trademark_report.questionnaire_profiles import default_profile_library
     from trademark_report.software_models import SoftwareAuthor, SoftwareConsentData
 
     report = ReportData(
@@ -1081,6 +1214,11 @@ def _packaged_self_test() -> int:
         probabilities=[ProbabilityEntry(value="ВЫСОКАЯ")],
     )
     try:
+        _load_classes()
+        if not default_profile_library().profiles:
+            raise RuntimeError("Библиотека профилей анкет пуста.")
+        if not (ROOT / "assets" / "app_background.jpg").is_file():
+            raise FileNotFoundError("Не найден фон приложения.")
         with TemporaryDirectory() as directory:
             output = Path(directory) / "self-test.docx"
             save_report(report, output)
@@ -1109,7 +1247,8 @@ def _packaged_self_test() -> int:
             )
             outputs = (output, consent_output)
             return 0 if all(item.is_file() and item.stat().st_size for item in outputs) else 1
-    except Exception:
+    except Exception as exc:
+        print(f"Self-test failed: {exc}", file=sys.stderr)
         return 1
 
 

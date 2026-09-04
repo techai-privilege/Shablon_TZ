@@ -6,7 +6,6 @@ import pytest
 
 from trademark_report.wipo import WipoParseError, fetch_wipo_trademark, parse_wipo_html
 
-
 URL = "https://www3.wipo.int/madrid/monitor/en/showData.jsp?ID=ROM.1753467&DES=1"
 IMAGE_URL = (
     "https://www3.wipo.int/madrid/monitor/jsp/data.jsp?"
@@ -41,6 +40,18 @@ def test_parse_wipo_record() -> None:
     assert record.owner == 'Obschestvo s ogranichennoi otvetstvennostyu "Aziya Layf"'
     assert record.nice_class_numbers == ["03", "05", "16"]
     assert record.image_url == IMAGE_URL
+
+
+def test_relative_image_url_is_resolved_and_classes_are_sanitized() -> None:
+    html = HTML.replace(IMAGE_URL, "/madrid/monitor/jsp/data.jsp?KEY=ROM_ACT.1753467")
+    html = html.replace("03, 05, 16", "03, 05, 16, 16, 99, 00")
+
+    record = parse_wipo_html(html, URL)
+
+    assert record.image_url == (
+        "https://www3.wipo.int/madrid/monitor/jsp/data.jsp?KEY=ROM_ACT.1753467"
+    )
+    assert record.nice_class_numbers == ["03", "05", "16"]
 
 
 @dataclass

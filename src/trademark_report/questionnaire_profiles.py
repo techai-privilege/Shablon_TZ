@@ -6,12 +6,12 @@ contain no client values or personal data; filled documents remain input only.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from functools import lru_cache
 import json
-from pathlib import Path
 import re
 import sys
+from dataclasses import dataclass, field
+from functools import lru_cache
+from pathlib import Path
 from typing import Iterable, Mapping
 
 
